@@ -771,10 +771,26 @@ class TextInjector:
                         logger.error("Text injection timed out on final attempt")
                         raise
 
-            # Try to reset any stuck modifiers
+            # Release any modifier keys that may be stuck down. Use keyup on the
+            # modifier keysyms directly rather than sending Escape: pressing
+            # Escape does not actually reset modifiers (--clearmodifiers only
+            # temporarily clears them while the keystroke is sent), and a stray
+            # Escape is destructive in TUIs that bind it to "cancel input" (e.g.
+            # the Claude Code prompt clears the in-progress message on Escape).
             try:
                 subprocess.run(
-                    ["xdotool", "key", "--clearmodifiers", "Escape"],
+                    [
+                        "xdotool",
+                        "keyup",
+                        "Control_L",
+                        "Control_R",
+                        "Shift_L",
+                        "Shift_R",
+                        "Alt_L",
+                        "Alt_R",
+                        "Super_L",
+                        "Super_R",
+                    ],
                     env=env,
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,

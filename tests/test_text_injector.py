@@ -285,6 +285,42 @@ class TestTextInjector(unittest.TestCase):
         # Still no subprocess calls
         self.mock_subprocess.assert_not_called()
 
+    def test_x11_injection_does_not_send_escape(self):
+        """Regression: xdotool injection must not press Escape afterward.
+
+        A stray Escape is destructive in TUIs that bind it to "cancel input"
+        (e.g. the Claude Code prompt clears the in-progress message on Escape).
+        The post-injection cleanup must release stuck modifiers via keyup, not
+        send an Escape keystroke.
+        """
+        with patch.dict("os.environ", {"XDG_SESSION_TYPE": "x11"}):
+            injector = TextInjector()
+            injector.environment = DesktopEnvironment.X11
+
+            calls = []
+
+            def capture_call(*args, **kwargs):
+                calls.append((args, kwargs))
+                process = MagicMock()
+                process.returncode = 0
+                return process
+
+            self.mock_subprocess.side_effect = capture_call
+
+            injector.inject_text("Hello world")
+
+            cmds = [args[0] for args, _ in calls if args and isinstance(args[0], list)]
+            # No command should send an Escape keystroke.
+            self.assertFalse(
+                any("Escape" in cmd for cmd in cmds),
+                f"Injection sent an Escape keystroke: {cmds}",
+            )
+            # The modifier-release cleanup should run via keyup.
+            self.assertTrue(
+                any(cmd[:2] == ["xdotool", "keyup"] for cmd in cmds),
+                f"Expected an 'xdotool keyup' modifier release, got: {cmds}",
+            )
+
     def test_missing_dependencies(self):
         """Test error when no text injection dependencies are available."""
         # No tools available
