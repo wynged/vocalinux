@@ -439,10 +439,28 @@ def main():
             if success:
                 action_handler.set_last_injected_text(text)
 
+        # Track the previous recognition state so we can distinguish a brand-new
+        # listening session (IDLE -> LISTENING, started by the user) from the
+        # mid-session re-entry the recognition loop performs after each pause
+        # (PROCESSING -> LISTENING).  Only the former should reset the buffer.
+        previous_state = {"value": RecognitionState.IDLE}
+
         def on_state_change(state: RecognitionState) -> None:
-            """Reset the last-injected buffer when a new listening session starts."""
-            if state == RecognitionState.LISTENING:
+            """Reset the last-injected buffer only when a new listening session starts.
+
+            The recognition loop re-enters LISTENING after every transcribed
+            segment (PROCESSING -> LISTENING) while dictation is still active.
+            Clearing the buffer on those re-entries would make each post-pause
+            segment look like the first one, dropping the inter-segment space.
+            So we reset only on the IDLE -> LISTENING transition that marks an
+            actual new session.
+            """
+            if (
+                state == RecognitionState.LISTENING
+                and previous_state["value"] == RecognitionState.IDLE
+            ):
                 action_handler.set_last_injected_text("")
+            previous_state["value"] = state
 
         # Connect speech recognition to text injection and action handling
         speech_engine.register_text_callback(text_callback_wrapper)

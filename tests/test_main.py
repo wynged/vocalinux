@@ -750,5 +750,77 @@ class TestTextCallbackSpacing(unittest.TestCase):
         self.assertEqual(calls, ["Hello.", " World"])
 
 
+class TestStateChangeReset(unittest.TestCase):
+    """Test buffer-reset logic in on_state_change.
+
+    Regression guard: the recognition loop re-enters LISTENING after each
+    transcribed segment (PROCESSING -> LISTENING) while dictation is still
+    active. The buffer must only be reset on a genuinely new session
+    (IDLE -> LISTENING); otherwise each post-pause segment looks like the
+    first one and loses its inter-segment space.
+    """
+
+    def _make_callbacks(self):
+        """Build text_callback_wrapper + on_state_change with mocked deps.
+
+        Mirrors the closures defined in vocalinux.main.main().
+        """
+        from vocalinux.common_types import RecognitionState
+        from vocalinux.ui.action_handler import ActionHandler
+
+        text_system = MagicMock()
+        text_system.inject_text.return_value = True
+        action_handler = ActionHandler(text_system)
+
+        def text_callback_wrapper(text: str):
+            text_to_inject = text.strip()
+            if not text_to_inject:
+                return
+            if action_handler.last_injected_text and action_handler.last_injected_text.strip():
+                text_to_inject = " " + text_to_inject
+            success = text_system.inject_text(text_to_inject)
+            if success:
+                action_handler.set_last_injected_text(text)
+
+        previous_state = {"value": RecognitionState.IDLE}
+
+        def on_state_change(state):
+            if (
+                state == RecognitionState.LISTENING
+                and previous_state["value"] == RecognitionState.IDLE
+            ):
+                action_handler.set_last_injected_text("")
+            previous_state["value"] = state
+
+        return text_callback_wrapper, on_state_change, text_system, RecognitionState
+
+    def test_post_pause_segment_keeps_space_after_relisten(self):
+        """A PROCESSING -> LISTENING re-entry mid-session must not drop the space."""
+        cb, on_state, text_system, S = self._make_callbacks()
+
+        on_state(S.LISTENING)  # session starts (IDLE -> LISTENING)
+        cb("Hello")  # first segment
+        on_state(S.PROCESSING)  # pause: segment transcribed
+        on_state(S.LISTENING)  # loop re-enters LISTENING (the bug trigger)
+        cb("world")  # second segment after pause
+
+        calls = [c.args[0] for c in text_system.inject_text.call_args_list]
+        self.assertEqual(calls, ["Hello", " world"])
+
+    def test_new_session_resets_buffer(self):
+        """A genuine new session (IDLE -> LISTENING) starts with no leading space."""
+        cb, on_state, text_system, S = self._make_callbacks()
+
+        on_state(S.LISTENING)
+        cb("first session")
+        on_state(S.PROCESSING)
+        on_state(S.IDLE)  # session ends
+        text_system.inject_text.reset_mock()
+
+        on_state(S.LISTENING)  # brand-new session
+        cb("second session")
+        text_system.inject_text.assert_called_once_with("second session")
+
+
 if __name__ == "__main__":
     unittest.main()
