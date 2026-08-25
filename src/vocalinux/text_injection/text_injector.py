@@ -25,7 +25,7 @@ from .ibus_engine import (
 logger = logging.getLogger(__name__)
 
 
-def _leave_i3_binding_mode() -> None:
+def _leave_i3_binding_mode(environment=None) -> None:
     """Drop i3 back to its default binding mode before sending keystrokes.
 
     While i3 sits in a binding mode such as Regolith's "Resize Mode", it grabs
@@ -39,6 +39,14 @@ def _leave_i3_binding_mode() -> None:
     name is config-defined -- Regolith calls it "Resize Mode", not "resize". A
     no-op when i3 is already in default, and when i3 isn't the window manager.
     """
+    # i3 is an X11 window manager. Under Wayland there is no binding mode to
+    # leave, and spending a subprocess per injection to discover that is waste.
+    if environment is not None and environment not in (
+        DesktopEnvironment.X11,
+        DesktopEnvironment.X11_IBUS,
+    ):
+        return
+
     try:
         state = subprocess.run(
             ["i3-msg", "-t", "get_binding_state"],
@@ -48,6 +56,13 @@ def _leave_i3_binding_mode() -> None:
         )
         if state.returncode != 0:
             logger.debug(f"i3-msg get_binding_state failed: {state.stderr.strip()}")
+            return
+
+        # Guard the type as well as the parse. text=True makes stdout a str in
+        # production, but this runs on the injection path for EVERY segment, and
+        # anything unexpected here must degrade to "don't touch the mode" rather
+        # than raise into inject_text() and kill dictation outright.
+        if not isinstance(state.stdout, str):
             return
 
         mode = json.loads(state.stdout).get("name", "default")
@@ -61,7 +76,10 @@ def _leave_i3_binding_mode() -> None:
             stderr=subprocess.DEVNULL,
             timeout=1,
         )
-    except (FileNotFoundError, OSError, ValueError, subprocess.SubprocessError) as e:
+    # Deliberately broad, for the same reason as the blocked-apps lookup: this is
+    # a best-effort courtesy that runs before every injection. Failing to leave a
+    # binding mode should cost you a garbled resize, not the whole dictation.
+    except Exception as e:  # noqa: BLE001
         logger.debug(f"Could not leave i3 binding mode: {e}")
 
 
@@ -640,8 +658,14 @@ class TextInjector:
                     check=True,
                     timeout=2,
                 )
-                return result.stdout.strip()
-            except (subprocess.SubprocessError, OSError):
+                stdout = result.stdout
+                return stdout.strip() if isinstance(stdout, str) else ""
+            # Deliberately broad. This is an ADVISORY gate that runs before every
+            # injection: if identifying the focused window fails for any reason,
+            # the correct outcome is "not blocked" (inject normally), never an
+            # exception escaping into inject_text() and killing dictation over a
+            # window-title lookup.
+            except Exception:  # noqa: BLE001
                 return ""
 
         window_id = _run(["xdotool", "getactivewindow"])
@@ -721,7 +745,7 @@ class TextInjector:
 
         # Leave any i3 binding mode (e.g. resize) first, so the keystrokes below
         # reach the focused window instead of driving the mode's bindings.
-        _leave_i3_binding_mode()
+        _leave_i3_binding_mode(self.environment)
 
         logger.info(f"Starting text injection: '{text}' (length: {len(text)})")
         logger.debug(f"Environment: {self.environment}")
@@ -1078,7 +1102,7 @@ class TextInjector:
         """
         logger.debug(f"Injecting keyboard shortcut: {shortcut}")
 
-        _leave_i3_binding_mode()
+        _leave_i3_binding_mode(self.environment)
 
         try:
             if (
