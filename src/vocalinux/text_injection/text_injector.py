@@ -5,6 +5,7 @@ This module is responsible for injecting recognized text into the active
 application, supporting both X11 and Wayland environments.
 """
 
+import json
 import logging
 import os
 import shutil
@@ -22,6 +23,46 @@ from .ibus_engine import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _leave_i3_binding_mode() -> None:
+    """Drop i3 back to its default binding mode before sending keystrokes.
+
+    While i3 sits in a binding mode such as Regolith's "Resize Mode", it grabs
+    the whole keyboard, so injected keys fire that mode's bindings instead of
+    reaching the focused window -- dictating in resize mode resizes windows at
+    random. This must run per injection rather than once per dictation session:
+    in toggle mode a session stays open indefinitely, so the mode is usually
+    entered long after recognition started.
+
+    The check is name-agnostic (any non-default mode is left) because the mode's
+    name is config-defined -- Regolith calls it "Resize Mode", not "resize". A
+    no-op when i3 is already in default, and when i3 isn't the window manager.
+    """
+    try:
+        state = subprocess.run(
+            ["i3-msg", "-t", "get_binding_state"],
+            capture_output=True,
+            text=True,
+            timeout=1,
+        )
+        if state.returncode != 0:
+            logger.debug(f"i3-msg get_binding_state failed: {state.stderr.strip()}")
+            return
+
+        mode = json.loads(state.stdout).get("name", "default")
+        if mode == "default":
+            return
+
+        logger.info(f"Leaving i3 binding mode '{mode}' before injecting")
+        subprocess.run(
+            ["i3-msg", "mode", "default"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=1,
+        )
+    except (FileNotFoundError, OSError, ValueError, subprocess.SubprocessError) as e:
+        logger.debug(f"Could not leave i3 binding mode: {e}")
 
 
 class DesktopEnvironment(Enum):
@@ -59,6 +100,10 @@ class TextInjector:
         self._state_lock = threading.Lock()
         self._clipboard_tool_health = {}
         self._clipboard_timeout = 0.35
+        # Throttle for "injection suppressed" notifications: a single dictation
+        # session injects several segments, and we don't want one notification
+        # per segment when the focused app is on the blocklist.
+        self._last_block_notify_ts = 0.0
 
         # Force Wayland mode if requested
         if wayland_mode and self.environment == DesktopEnvironment.X11:
@@ -542,6 +587,117 @@ class TextInjector:
         except Exception as e:
             logger.debug(f"Could not show clipboard notification: {e}")
 
+    def _get_blocked_apps(self) -> list:
+        """Read the per-app injection blocklist from config.
+
+        Each entry is matched case-insensitively as a substring against both the
+        focused window's class and its title, so a single entry like "gather"
+        catches the Gather desktop app (window class) *and* a browser tab titled
+        "Gather" (window title) without muting the rest of the browser.
+        """
+        try:
+            import json
+
+            config_path = os.path.expanduser("~/.config/vocalinux/config.json")
+            if os.path.exists(config_path):
+                with open(config_path, "r") as f:
+                    config = json.load(f)
+                entries = config.get("text_injection", {}).get("blocked_apps", [])
+                return [str(e).lower() for e in entries if str(e).strip()]
+        except Exception as e:
+            logger.debug(f"Could not read blocked_apps setting: {e}")
+        return []
+
+    def _get_focused_window_identity(self):
+        """Return ``(class, title)`` of the focused X11 window, both lowercased.
+
+        Returns ``("", "")`` when the information is unavailable (pure Wayland,
+        or any xdotool failure). Used to decide whether injection is blocked for
+        the currently focused application.
+        """
+        if self.environment not in (
+            DesktopEnvironment.X11,
+            DesktopEnvironment.X11_IBUS,
+            DesktopEnvironment.WAYLAND_XDOTOOL,
+        ):
+            return "", ""
+
+        env = os.environ.copy()
+        if self.environment == DesktopEnvironment.WAYLAND_XDOTOOL:
+            env["GDK_BACKEND"] = "x11"
+            env["QT_QPA_PLATFORM"] = "xcb"
+            if not env.get("DISPLAY"):
+                env["DISPLAY"] = ":0"
+
+        def _run(args):
+            try:
+                result = subprocess.run(
+                    args,
+                    env=env,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    check=True,
+                    timeout=2,
+                )
+                return result.stdout.strip()
+            except (subprocess.SubprocessError, OSError):
+                return ""
+
+        window_id = _run(["xdotool", "getactivewindow"])
+        if not window_id:
+            return "", ""
+        window_class = _run(["xdotool", "getwindowclassname", window_id])
+        window_title = _run(["xdotool", "getwindowname", window_id])
+        return window_class.lower(), window_title.lower()
+
+    def _is_injection_blocked_for_focused_window(self) -> bool:
+        """Return True if the focused app is on the user's injection blocklist.
+
+        When blocked, dictated text must NOT be typed. A throttled desktop
+        notification is shown instead so the suppression is visible without
+        spamming one notification per dictated segment.
+        """
+        blocked = self._get_blocked_apps()
+        if not blocked:
+            return False
+
+        window_class, window_title = self._get_focused_window_identity()
+        haystack = f"{window_class} {window_title}"
+        match = next((pattern for pattern in blocked if pattern in haystack), None)
+        if match is None:
+            return False
+
+        logger.info(
+            "Injection suppressed: focused window matches blocklist entry "
+            f"'{match}' (class='{window_class}', title='{window_title}')"
+        )
+
+        now = time.monotonic()
+        if now - self._last_block_notify_ts > 4.0:
+            self._notify_injection_blocked(window_title or window_class or "focused window")
+            self._last_block_notify_ts = now
+        return True
+
+    def _notify_injection_blocked(self, app_label: str):
+        """Show a desktop notification that injection was suppressed for an app."""
+        try:
+            subprocess.Popen(
+                [
+                    "notify-send",
+                    "-i",
+                    "microphone-sensitivity-muted",
+                    "-a",
+                    "Vocalinux",
+                    "Dictation suppressed",
+                    f"'{app_label}' is on the injection blocklist — text was not typed.",
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception as e:
+            logger.debug(f"Could not show injection-blocked notification: {e}")
+
     def inject_text(self, text: str) -> bool:
         """
         Inject text into the currently focused application.
@@ -555,6 +711,17 @@ class TextInjector:
         if not text or not text.strip():
             logger.debug("Empty text provided, skipping injection")
             return True
+
+        # Per-app blocklist: in apps like Gather, single keystrokes are commands
+        # (movement, interactions), so typing a dictated sentence fires a flurry
+        # of shortcuts. When the focused window matches the user's blocklist,
+        # suppress injection entirely (notify-only) instead of typing.
+        if self._is_injection_blocked_for_focused_window():
+            return True
+
+        # Leave any i3 binding mode (e.g. resize) first, so the keystrokes below
+        # reach the focused window instead of driving the mode's bindings.
+        _leave_i3_binding_mode()
 
         logger.info(f"Starting text injection: '{text}' (length: {len(text)})")
         logger.debug(f"Environment: {self.environment}")
@@ -910,6 +1077,8 @@ class TextInjector:
             True if injection was successful, False otherwise
         """
         logger.debug(f"Injecting keyboard shortcut: {shortcut}")
+
+        _leave_i3_binding_mode()
 
         try:
             if (
