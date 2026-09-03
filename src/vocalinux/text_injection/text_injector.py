@@ -8,6 +8,7 @@ application, supporting both X11 and Wayland environments.
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import threading
@@ -118,6 +119,13 @@ class TextInjector:
         self._state_lock = threading.Lock()
         self._clipboard_tool_health = {}
         self._clipboard_timeout = 0.35
+        # Clipboard-paste injection (X11): what the clipboard held before we
+        # borrowed it, and which injection is entitled to put it back. See
+        # _inject_with_xdotool_paste.
+        self._paste_lock = threading.Lock()
+        self._paste_generation = 0
+        self._paste_pending_restore = None  # (generation, previous_text_or_None)
+        self._paste_restore_delay = 0.5
         # Throttle for "injection suppressed" notifications: a single dictation
         # session injects several segments, and we don't want one notification
         # per segment when the focused app is on the blocklist.
@@ -671,7 +679,15 @@ class TextInjector:
         window_id = _run(["xdotool", "getactivewindow"])
         if not window_id:
             return "", ""
-        window_class = _run(["xdotool", "getwindowclassname", window_id])
+        # `xdotool getwindowclassname` only exists from xdotool 3.2021 on;
+        # Ubuntu's 3.20160805 answers "Unknown command", which used to make
+        # the class silently empty here. WM_CLASS via xprop works everywhere
+        # and carries both halves (instance, class) -- e.g. Chrome's app
+        # windows are ("crx_<id>", "Google-chrome"), so both are returned,
+        # space-joined, for substring matching.
+        window_class = " ".join(
+            re.findall(r'"([^"]*)"', _run(["xprop", "-id", window_id, "WM_CLASS"]))
+        )
         window_title = _run(["xdotool", "getwindowname", window_id])
         return window_class.lower(), window_title.lower()
 
@@ -853,6 +869,155 @@ class TextInjector:
                 logger.warning("Could not import audio feedback module")
             return False
 
+    # Window classes whose paste chord is Ctrl+Shift+V, because Ctrl+V is a
+    # control byte to the program inside. Matched as substrings of WM_CLASS.
+    TERMINAL_WINDOW_CLASSES = (
+        "wezterm",
+        "xterm",
+        "rxvt",
+        "alacritty",
+        "kitty",
+        "terminal",
+        "terminator",
+        "tilix",
+        "konsole",
+        "st-256color",
+        "foot",
+    )
+
+    def _paste_injection_enabled(self) -> bool:
+        """``text_injection.paste_injection`` from config; defaults to on."""
+        try:
+            import json
+
+            config_path = os.path.expanduser("~/.config/vocalinux/config.json")
+            if os.path.exists(config_path):
+                with open(config_path, "r") as f:
+                    config = json.load(f)
+                return bool(config.get("text_injection", {}).get("paste_injection", True))
+        except Exception as e:
+            logger.debug(f"Could not read paste_injection setting: {e}")
+        return True
+
+    def _paste_chord_for_focused_window(self) -> str:
+        window_class, _ = self._get_focused_window_identity()
+        if any(marker in window_class for marker in self.TERMINAL_WINDOW_CLASSES):
+            return "ctrl+shift+v"
+        return "ctrl+v"
+
+    def _read_x11_clipboard(self, env) -> Optional[str]:
+        """The clipboard's text, or None if it holds none (empty, or an image)."""
+        try:
+            result = subprocess.run(
+                ["xclip", "-o", "-selection", "clipboard"],
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                timeout=1,
+            )
+        except Exception as e:  # noqa: BLE001 - advisory; losing the old clipboard is not fatal
+            logger.debug(f"Could not read clipboard: {e}")
+            return None
+        if result.returncode != 0 or not isinstance(result.stdout, str):
+            return None
+        return result.stdout
+
+    def _set_x11_clipboard(self, text: str, env) -> bool:
+        # xclip forks a child that owns the selection until someone else claims
+        # it, and that child inherits stderr. With stderr=PIPE, run() waits
+        # for EOF that never comes and the 0.35 s clipboard timeout fires --
+        # which is why _copy_to_clipboard marks xclip unhealthy on this box.
+        # Both streams go to DEVNULL here so the parent's exit is the end.
+        try:
+            subprocess.run(
+                ["xclip", "-selection", "clipboard"],
+                input=text,
+                env=env,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                check=True,
+                timeout=1,
+            )
+            return True
+        except Exception as e:  # noqa: BLE001 - any failure means "type it instead"
+            logger.warning(f"Could not set clipboard for paste injection: {e}")
+            return False
+
+    def _inject_with_xdotool_paste(self, text: str, env) -> bool:
+        """Put ``text`` on the clipboard and press the focused window's paste chord.
+
+        Returns False, with nothing typed, when paste injection is disabled,
+        xclip is missing, or the clipboard could not be set -- the caller then
+        types the text instead. The clipboard's previous text is put back a
+        moment after the paste (an image or other non-text content cannot be
+        saved with xclip and is simply left replaced).
+
+        Segments can arrive faster than the restore delay, so the restore is
+        owned by a generation counter: a newer injection reuses the *original*
+        saved text rather than snapshotting the previous segment, and an older
+        restore that fires after a newer injection does nothing.
+        """
+        if not self._paste_injection_enabled():
+            return False
+        if not shutil.which("xclip"):
+            logger.debug("xclip not available; typing instead of pasting")
+            return False
+
+        with self._paste_lock:
+            self._paste_generation += 1
+            generation = self._paste_generation
+            if self._paste_pending_restore is None:
+                previous = self._read_x11_clipboard(env)
+            else:
+                previous = self._paste_pending_restore[1]
+            self._paste_pending_restore = (generation, previous)
+
+        if not self._set_x11_clipboard(text, env):
+            with self._paste_lock:
+                if self._paste_pending_restore and self._paste_pending_restore[0] == generation:
+                    self._paste_pending_restore = None
+            return False
+
+        chord = self._paste_chord_for_focused_window()
+        try:
+            subprocess.run(
+                ["xdotool", "key", "--clearmodifiers", chord],
+                env=env,
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=3,
+            )
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+            logger.warning(f"Paste keystroke failed ({e}); falling back to typing")
+            self._schedule_clipboard_restore(generation, env)
+            return False
+
+        logger.info(
+            f"Text injected via clipboard paste ({chord}): '{text[:20]}...' ({len(text)} chars)"
+        )
+        self._schedule_clipboard_restore(generation, env)
+        return True
+
+    def _schedule_clipboard_restore(self, generation: int, env) -> None:
+        def restore():
+            time.sleep(self._paste_restore_delay)
+            with self._paste_lock:
+                pending = self._paste_pending_restore
+                if pending is None or pending[0] != generation:
+                    return  # a newer injection owns the clipboard now
+                self._paste_pending_restore = None
+            previous = pending[1]
+            if previous is None:
+                return
+            if self._set_x11_clipboard(previous, env):
+                logger.debug("Restored the clipboard after paste injection")
+
+        threading.Thread(target=restore, daemon=True, name="clipboard-restore").start()
+
     def _inject_with_xdotool(self, text: str):
         """
         Inject text using xdotool for X11 environments.
@@ -902,6 +1067,12 @@ class TextInjector:
                     time.sleep(0.2)
             except Exception as e:
                 logger.debug(f"Window focus command failed: {e}")
+
+        # Paste first: one Ctrl+V lands a whole utterance at once, where typing
+        # runs at ~12 ms per character (a 1000-char dictation took 11.8 s to
+        # type against 3.2 s to transcribe). Typing remains the fallback.
+        if self._inject_with_xdotool_paste(text, env):
+            return
 
         # Inject text using xdotool
         try:

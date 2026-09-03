@@ -49,6 +49,14 @@ class TestTextInjector(unittest.TestCase):
         # Set default return values
         self.mock_which.return_value = "/usr/bin/xdotool"  # Default to having xdotool
 
+        # The X11 path pastes before it types. These tests were written
+        # against typing, so paste is off here and the paste tests turn it
+        # back on with an inner patch.
+        self.patch_paste_enabled = patch.object(
+            TextInjector, "_paste_injection_enabled", return_value=False
+        )
+        self.patch_paste_enabled.start()
+
         # Setup subprocess mock
         mock_process = MagicMock()
         mock_process.returncode = 0
@@ -320,6 +328,105 @@ class TestTextInjector(unittest.TestCase):
                 any(cmd[:2] == ["xdotool", "keyup"] for cmd in cmds),
                 f"Expected an 'xdotool keyup' modifier release, got: {cmds}",
             )
+
+    # --- clipboard-paste injection -------------------------------------
+
+    def _x11_injector_with_paste(self, wm_class='"Google-chrome", "Google-chrome"'):
+        """An X11 injector whose subprocess mock answers the paste path's queries."""
+        injector = TextInjector()
+        injector.environment = DesktopEnvironment.X11
+        calls = []
+
+        def fake_run(cmd, *args, **kwargs):
+            calls.append((list(cmd), kwargs))
+            process = MagicMock()
+            process.returncode = 0
+            process.stderr = ""
+            if cmd[:2] == ["xclip", "-o"]:
+                process.stdout = "what was on the clipboard"
+            elif cmd[0] == "xprop":
+                process.stdout = f"WM_CLASS(STRING) = {wm_class}\n"
+            elif cmd[:2] == ["xdotool", "getactivewindow"]:
+                process.stdout = "1234"
+            else:
+                process.stdout = ""
+            return process
+
+        self.mock_subprocess.side_effect = fake_run
+        return injector, calls
+
+    def test_x11_paste_injection_pastes_instead_of_typing(self):
+        """On X11 the text goes onto the clipboard and one Ctrl+V lands it."""
+        injector, calls = self._x11_injector_with_paste()
+        started = []
+
+        # Run the restore thread inline so its effect is visible synchronously.
+        def inline_thread(target=None, **kwargs):
+            started.append(target)
+            return MagicMock(start=target)
+
+        with patch.object(TextInjector, "_paste_injection_enabled", return_value=True):
+            with patch("threading.Thread", side_effect=inline_thread):
+                self.assertTrue(injector.inject_text("Hello world"))
+
+        cmds = [c for c, _ in calls]
+        sets = [kw for c, kw in calls if c == ["xclip", "-selection", "clipboard"]]
+        self.assertEqual([kw["input"] for kw in sets], ["Hello world", "what was on the clipboard"])
+        self.assertIn(["xdotool", "key", "--clearmodifiers", "ctrl+v"], cmds)
+        self.assertFalse(any(c[:2] == ["xdotool", "type"] for c in cmds), cmds)
+        # xclip's forked selection owner inherits stderr; piping it would hang.
+        for kw in sets:
+            self.assertIs(kw.get("stderr"), subprocess.DEVNULL)
+
+    def test_x11_paste_uses_ctrl_shift_v_in_terminals(self):
+        injector, calls = self._x11_injector_with_paste(
+            wm_class='"org.wezfurlong.wezterm", "org.wezfurlong.wezterm"'
+        )
+        with patch.object(TextInjector, "_paste_injection_enabled", return_value=True):
+            with patch("threading.Thread", return_value=MagicMock()):
+                injector.inject_text("ls -la")
+        cmds = [c for c, _ in calls]
+        self.assertIn(["xdotool", "key", "--clearmodifiers", "ctrl+shift+v"], cmds)
+        self.assertNotIn(["xdotool", "key", "--clearmodifiers", "ctrl+v"], cmds)
+
+    def test_x11_paste_falls_back_to_typing_when_clipboard_fails(self):
+        injector, calls = self._x11_injector_with_paste()
+        inner = self.mock_subprocess.side_effect
+
+        def failing_xclip(cmd, *args, **kwargs):
+            if list(cmd) == ["xclip", "-selection", "clipboard"]:
+                raise subprocess.CalledProcessError(1, cmd)
+            return inner(cmd, *args, **kwargs)
+
+        self.mock_subprocess.side_effect = failing_xclip
+        with patch.object(TextInjector, "_paste_injection_enabled", return_value=True):
+            self.assertTrue(injector.inject_text("Hello world"))
+        cmds = [c for c, _ in calls]
+        self.assertFalse(any(c[1:2] == ["key"] and "v" in c[-1] for c in cmds), cmds)
+        self.assertTrue(any(c[:2] == ["xdotool", "type"] for c in cmds), cmds)
+
+    def test_x11_paste_restores_original_clipboard_once_across_segments(self):
+        """Two quick segments put back what the USER had, not segment one."""
+        injector, calls = self._x11_injector_with_paste()
+        restores = []
+        with patch.object(TextInjector, "_paste_injection_enabled", return_value=True):
+            with patch("threading.Thread", side_effect=lambda target=None, **kw: (
+                restores.append(target), MagicMock())[1]):
+                self.assertTrue(injector._inject_with_xdotool_paste("segment one", os.environ))
+                self.assertTrue(injector._inject_with_xdotool_paste("segment two", os.environ))
+        reads = [c for c, _ in calls if c[:2] == ["xclip", "-o"]]
+        self.assertEqual(len(reads), 1, "second segment must not snapshot segment one")
+
+        restores[0]()  # stale: a newer injection owns the clipboard
+        restores[1]()
+        sets = [kw["input"] for c, kw in calls if c == ["xclip", "-selection", "clipboard"]]
+        self.assertEqual(sets, ["segment one", "segment two", "what was on the clipboard"])
+
+    def test_focused_window_identity_reads_wm_class_via_xprop(self):
+        """xdotool 3.2016 has no getwindowclassname; WM_CLASS comes from xprop."""
+        injector, _ = self._x11_injector_with_paste(wm_class='"crx_abc", "Google-chrome"')
+        window_class, _title = injector._get_focused_window_identity()
+        self.assertEqual(window_class, "crx_abc google-chrome")
 
     def test_missing_dependencies(self):
         """Test error when no text injection dependencies are available."""
