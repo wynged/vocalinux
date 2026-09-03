@@ -16,6 +16,7 @@ import time
 from enum import Enum
 from typing import Optional  # noqa: F401
 
+from .clipboard_owner import ClipboardOwner, client_of
 from .ibus_engine import (
     IBusTextInjector,
     is_ibus_active_input_method,
@@ -126,6 +127,14 @@ class TextInjector:
         self._paste_generation = 0
         self._paste_pending_restore = None  # (generation, previous_text_or_None)
         self._paste_restore_delay = 0.5
+        # The clipboard owner, which is what makes a paste verifiable at all;
+        # created on first use because it opens its own X connection.
+        self._clipboard_owner: Optional[ClipboardOwner] = None
+        # A paste that nothing read: its text stays on the clipboard for the
+        # user to place by hand, and the next unread segment is appended to it
+        # rather than replacing it. See _handle_paste_that_did_not_land.
+        self._unlanded = None
+        self._last_no_target_notify_ts = 0.0
         # Throttle for "injection suppressed" notifications: a single dictation
         # session injects several segments, and we don't want one notification
         # per segment when the focused app is on the blocklist.
@@ -190,6 +199,16 @@ class TextInjector:
                 self._ibus_injector.stop()
                 self._ibus_injector = None
             self._ibus_ready = False
+            if self._clipboard_owner is not None:
+                # An X selection dies with the process that owns it, and what
+                # we are still holding at shutdown is dictation the user has
+                # not placed yet. Hand it to xclip, whose forked owner outlives
+                # us, rather than taking it to the grave.
+                held = self._clipboard_owner.current_text()
+                if held:
+                    self._set_x11_clipboard(held, os.environ.copy())
+                self._clipboard_owner.stop()
+                self._clipboard_owner = None
 
     def _detect_environment(self) -> DesktopEnvironment:
         """
@@ -641,12 +660,21 @@ class TextInjector:
         or any xdotool failure). Used to decide whether injection is blocked for
         the currently focused application.
         """
+        return self._probe_focused_window()[1:]
+
+    def _probe_focused_window(self):
+        """Return ``(window_id, class, title)`` for the focused X11 window.
+
+        The id is what says which X client a later clipboard read came from,
+        so the paste path takes all three from one probe instead of asking
+        twice. ``(None, "", "")`` when the window cannot be identified.
+        """
         if self.environment not in (
             DesktopEnvironment.X11,
             DesktopEnvironment.X11_IBUS,
             DesktopEnvironment.WAYLAND_XDOTOOL,
         ):
-            return "", ""
+            return None, "", ""
 
         env = os.environ.copy()
         if self.environment == DesktopEnvironment.WAYLAND_XDOTOOL:
@@ -678,7 +706,7 @@ class TextInjector:
 
         window_id = _run(["xdotool", "getactivewindow"])
         if not window_id:
-            return "", ""
+            return None, "", ""
         # `xdotool getwindowclassname` only exists from xdotool 3.2021 on;
         # Ubuntu's 3.20160805 answers "Unknown command", which used to make
         # the class silently empty here. WM_CLASS via xprop works everywhere
@@ -689,7 +717,11 @@ class TextInjector:
             re.findall(r'"([^"]*)"', _run(["xprop", "-id", window_id, "WM_CLASS"]))
         )
         window_title = _run(["xdotool", "getwindowname", window_id])
-        return window_class.lower(), window_title.lower()
+        try:
+            numeric_id = int(window_id)
+        except ValueError:
+            numeric_id = None
+        return numeric_id, window_class.lower(), window_title.lower()
 
     def _is_injection_blocked_for_focused_window(self) -> bool:
         """Return True if the focused app is on the user's injection blocklist.
@@ -869,6 +901,17 @@ class TextInjector:
                 logger.warning("Could not import audio feedback module")
             return False
 
+    # How long to wait after the paste chord for something to read the
+    # clipboard. Measured on this desktop: a GTK entry, Chrome's omnibox and a
+    # WezTerm pane each asked within ~30-50 ms, so this is generous, and it is
+    # only ever waited out when the paste found nowhere to go.
+    PASTE_READ_TIMEOUT = 0.4
+    # How long dictation left on the clipboard keeps collecting later segments
+    # before the next one counts as a fresh thought. One utterance arrives as
+    # several segments a second or two apart, so this only has to outlast a
+    # pause; longer would risk appending to words the user has already placed.
+    UNLANDED_TTL = 20.0
+
     # Window classes whose paste chord is Ctrl+Shift+V, because Ctrl+V is a
     # control byte to the program inside. Matched as substrings of WM_CLASS.
     TERMINAL_WINDOW_CLASSES = (
@@ -899,8 +942,26 @@ class TextInjector:
             logger.debug(f"Could not read paste_injection setting: {e}")
         return True
 
+    def _paste_verify_enabled(self) -> bool:
+        """``text_injection.paste_verify`` from config; defaults to on.
+
+        Turning it off gives up knowing whether a paste landed and puts the
+        clipboard back in xclip's hands.
+        """
+        try:
+            config_path = os.path.expanduser("~/.config/vocalinux/config.json")
+            if os.path.exists(config_path):
+                with open(config_path, "r") as f:
+                    config = json.load(f)
+                return bool(config.get("text_injection", {}).get("paste_verify", True))
+        except Exception as e:  # noqa: BLE001 - an unreadable config must not stop injection
+            logger.debug(f"Could not read paste_verify setting: {e}")
+        return True
+
     def _paste_chord_for_focused_window(self) -> str:
-        window_class, _ = self._get_focused_window_identity()
+        return self._paste_chord_for_window_class(self._get_focused_window_identity()[0])
+
+    def _paste_chord_for_window_class(self, window_class: str) -> str:
         if any(marker in window_class for marker in self.TERMINAL_WINDOW_CLASSES):
             return "ctrl+shift+v"
         return "ctrl+v"
@@ -948,40 +1009,83 @@ class TextInjector:
     def _inject_with_xdotool_paste(self, text: str, env) -> bool:
         """Put ``text`` on the clipboard and press the focused window's paste chord.
 
-        Returns False, with nothing typed, when paste injection is disabled,
-        xclip is missing, or the clipboard could not be set -- the caller then
-        types the text instead. The clipboard's previous text is put back a
-        moment after the paste (an image or other non-text content cannot be
-        saved with xclip and is simply left replaced).
+        Returns False, with nothing typed, when paste injection is disabled or
+        the clipboard could not be set -- the caller then types the text
+        instead. The clipboard's previous text is put back a moment after the
+        paste (an image or other non-text content cannot be saved with xclip
+        and is simply left replaced).
 
         Segments can arrive faster than the restore delay, so the restore is
         owned by a generation counter: a newer injection reuses the *original*
         saved text rather than snapshotting the previous segment, and an older
         restore that fires after a newer injection does nothing.
+
+        When Vocalinux owns the clipboard itself, it can also tell whether the
+        paste landed anywhere -- see _handle_paste_that_did_not_land.
         """
         if not self._paste_injection_enabled():
             return False
-        if not shutil.which("xclip"):
+
+        owner = self._selection_owner()
+        if owner is None and not shutil.which("xclip"):
             logger.debug("xclip not available; typing instead of pasting")
             return False
+
+        window_id, window_class, _title = self._probe_focused_window()
 
         with self._paste_lock:
             self._paste_generation += 1
             generation = self._paste_generation
-            if self._paste_pending_restore is None:
-                previous = self._read_x11_clipboard(env)
-            else:
+            unlanded = self._live_unlanded()
+            if self._paste_pending_restore is not None:
                 previous = self._paste_pending_restore[1]
+            elif unlanded is not None:
+                # Still holding text the user has not placed yet: what to put
+                # back is what THEY had, not the dictation sitting there now.
+                previous = unlanded[1]
+            else:
+                previous = self._read_x11_clipboard(env)
             self._paste_pending_restore = (generation, previous)
 
-        if not self._set_x11_clipboard(text, env):
+        owner_holds = owner is not None and owner.set_text(text)
+        if not owner_holds and not self._set_x11_clipboard(text, env):
             with self._paste_lock:
                 if self._paste_pending_restore and self._paste_pending_restore[0] == generation:
                     self._paste_pending_restore = None
             return False
 
-        chord = self._paste_chord_for_focused_window()
-        try:
+        if not owner_holds:
+            owner = None
+        chord = self._paste_chord_for_window_class(window_class)
+        landed = self._press_paste(chord, env, owner, window_id)
+        if landed is None:
+            self._schedule_clipboard_restore(generation, env)
+            return False
+
+        if not landed:
+            self._handle_paste_that_did_not_land(text, generation, previous, owner)
+            return True
+
+        with self._paste_lock:
+            self._unlanded = None
+        logger.info(
+            f"Text injected via clipboard paste ({chord}): "
+            f"'{text[:20]}...' ({len(text)} chars)"
+        )
+        self._schedule_clipboard_restore(generation, env)
+        return True
+
+    def _press_paste(self, chord: str, env, owner, window_id):
+        """Send the paste chord.
+
+        Returns True if the text landed somewhere, False if nothing read the
+        clipboard, and None if the keystroke itself failed (the caller then
+        types instead). Without an owner there is nothing to observe, so the
+        answer is True: the paste is assumed to have worked, exactly as it was
+        before any of this could be checked.
+        """
+
+        def press():
             subprocess.run(
                 ["xdotool", "key", "--clearmodifiers", chord],
                 env=env,
@@ -991,16 +1095,100 @@ class TextInjector:
                 text=True,
                 timeout=3,
             )
+
+        try:
+            if owner is None:
+                press()
+                return True
+            with owner.watch() as watch:
+                press()
+                return watch.landed(client_of(window_id), self.PASTE_READ_TIMEOUT)
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
             logger.warning(f"Paste keystroke failed ({e}); falling back to typing")
-            self._schedule_clipboard_restore(generation, env)
-            return False
+            return None
 
-        logger.info(
-            f"Text injected via clipboard paste ({chord}): '{text[:20]}...' ({len(text)} chars)"
+    def _live_unlanded(self):
+        """The unplaced dictation still on the clipboard, or None.
+
+        It stops being live once something else claims the clipboard, or after
+        long enough that the next dictation is plainly a new thought rather
+        than the rest of the last one. Whether the *user* has since pasted it
+        by hand is not knowable: their Ctrl+V is a clipboard read like any
+        other, and a clipboard manager makes one of those every second.
+        """
+        unlanded = self._unlanded
+        if unlanded is None:
+            return None
+        _text, _previous, when, owner = unlanded
+        if time.monotonic() - when > self.UNLANDED_TTL:
+            return None
+        if not owner.owns():
+            return None
+        return unlanded
+
+    def _handle_paste_that_did_not_land(self, text: str, generation: int, previous, owner):
+        """Nothing read the clipboard, so the text went nowhere. Leave it there.
+
+        A dictation arrives as several segments whenever the speaker pauses,
+        and each one pastes on its own. Replacing the clipboard per segment
+        would leave only the last sentence to recover, so segments that find
+        nowhere to land accumulate instead.
+        """
+        with self._paste_lock:
+            if self._paste_pending_restore and self._paste_pending_restore[0] == generation:
+                # Do not put the old clipboard back: the dictation on it is the
+                # only copy the user has, and pasting it by hand is the point.
+                self._paste_pending_restore = None
+            unlanded = self._live_unlanded()
+
+        combined = f"{unlanded[0]} {text}" if unlanded is not None else text
+        if unlanded is not None and not owner.set_text(combined):
+            combined = text
+        logger.warning(
+            f"Nothing read the clipboard after the paste: {len(combined)} chars are "
+            "waiting there for the user to place"
         )
-        self._schedule_clipboard_restore(generation, env)
-        return True
+        with self._paste_lock:
+            self._unlanded = (combined, previous, time.monotonic(), owner)
+
+        now = time.monotonic()
+        if now - self._last_no_target_notify_ts > 4.0:
+            self._notify_paste_did_not_land()
+            self._last_no_target_notify_ts = now
+
+    def _notify_paste_did_not_land(self):
+        """Tell the user their words are on the clipboard and where to put them."""
+        try:
+            subprocess.Popen(
+                [
+                    "notify-send",
+                    "-i",
+                    "edit-paste",
+                    "-a",
+                    "Vocalinux",
+                    "Nowhere to paste",
+                    "The text couldn't find a place to land \u2014 "
+                    "press Ctrl+V where you want it.",
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception as e:  # noqa: BLE001 - a missing notify-send must not break dictation
+            logger.debug(f"Could not show the nowhere-to-paste notification: {e}")
+
+    def _selection_owner(self):
+        """The clipboard owner to paste through, or None to fall back to xclip.
+
+        Owning the selection in-process is the only way to see whether the
+        paste was read, so it is also how the text gets onto the clipboard.
+        """
+        if not self._paste_verify_enabled():
+            return None
+        with self._state_lock:
+            if self._clipboard_owner is None:
+                self._clipboard_owner = ClipboardOwner()
+            owner = self._clipboard_owner
+        return owner if owner.start() else None
 
     def _schedule_clipboard_restore(self, generation: int, env) -> None:
         def restore():

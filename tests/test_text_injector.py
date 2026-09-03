@@ -2,6 +2,7 @@
 Tests for text injection functionality.
 """
 
+import contextlib
 import os
 import subprocess
 import sys
@@ -421,6 +422,119 @@ class TestTextInjector(unittest.TestCase):
         restores[1]()
         sets = [kw["input"] for c, kw in calls if c == ["xclip", "-selection", "clipboard"]]
         self.assertEqual(sets, ["segment one", "segment two", "what was on the clipboard"])
+
+    # --- a paste with nowhere to land -----------------------------------
+
+    def _fake_owner(self, landed):
+        """A stand-in for the clipboard owner, answering "was it read?"."""
+
+        class FakeWatch:
+            def landed(self_inner, client_id, timeout):
+                return landed
+
+        class FakeOwner:
+            def __init__(self_inner):
+                self_inner.texts = []
+                self_inner.held = True
+
+            def set_text(self_inner, text):
+                self_inner.texts.append(text)
+                return True
+
+            @contextlib.contextmanager
+            def watch(self_inner):
+                yield FakeWatch()
+
+            def owns(self_inner):
+                return self_inner.held
+
+        return FakeOwner()
+
+    def test_paste_nothing_read_leaves_the_text_and_says_so(self):
+        """No text field to land in: keep the words, tell the user where they are."""
+        injector, calls = self._x11_injector_with_paste()
+        owner = self._fake_owner(landed=False)
+        with patch.object(TextInjector, "_paste_injection_enabled", return_value=True):
+            with patch.object(TextInjector, "_selection_owner", return_value=owner):
+                with patch("subprocess.Popen") as popen:
+                    self.assertTrue(injector.inject_text("words with nowhere to go"))
+
+        self.assertEqual(owner.texts, ["words with nowhere to go"])
+        cmds = [c for c, _ in calls]
+        self.assertIn(["xdotool", "key", "--clearmodifiers", "ctrl+v"], cmds)
+        # Typing it instead would fire the focused app's single-key shortcuts,
+        # which is the whole reason the paste had nowhere to land.
+        self.assertFalse(any(c[:2] == ["xdotool", "type"] for c in cmds), cmds)
+        # The dictation stays on the clipboard: putting the old contents back
+        # would destroy the only copy.
+        self.assertFalse(
+            any(c == ["xclip", "-selection", "clipboard"] for c in cmds),
+            "the user's previous clipboard must not be restored over the dictation",
+        )
+        notification = popen.call_args[0][0]
+        self.assertEqual(notification[0], "notify-send")
+        self.assertIn("Ctrl+V", " ".join(notification))
+
+    def test_unread_segments_accumulate_on_the_clipboard(self):
+        """A pause splits one dictation into segments; keep all of them."""
+        injector, _ = self._x11_injector_with_paste()
+        owner = self._fake_owner(landed=False)
+        with patch.object(TextInjector, "_paste_injection_enabled", return_value=True):
+            with patch.object(TextInjector, "_selection_owner", return_value=owner):
+                with patch("subprocess.Popen"):
+                    injector.inject_text("first half")
+                    injector.inject_text("second half")
+        self.assertEqual(owner.texts[-1], "first half second half")
+
+    def test_a_segment_starts_over_when_the_clipboard_changes_hands(self):
+        """Whatever replaced it is the user's; do not staple dictation onto it."""
+        injector, _ = self._x11_injector_with_paste()
+        owner = self._fake_owner(landed=False)
+        with patch.object(TextInjector, "_paste_injection_enabled", return_value=True):
+            with patch.object(TextInjector, "_selection_owner", return_value=owner):
+                with patch("subprocess.Popen"):
+                    injector.inject_text("first half")
+                    owner.held = False  # something else claimed the selection
+                    injector.inject_text("a new sentence")
+        self.assertEqual(owner.texts[-1], "a new sentence")
+
+    def test_unlanded_text_expires(self):
+        """A dictation minutes later is a new thought, not the rest of the last."""
+        injector, _ = self._x11_injector_with_paste()
+        owner = self._fake_owner(landed=False)
+        with patch.object(TextInjector, "_paste_injection_enabled", return_value=True):
+            with patch.object(TextInjector, "_selection_owner", return_value=owner):
+                with patch("subprocess.Popen"):
+                    injector.inject_text("first half")
+                    text, previous, when, held = injector._unlanded
+                    injector._unlanded = (text, previous, when - 300.0, held)
+                    injector.inject_text("a new sentence")
+        self.assertEqual(owner.texts[-1], "a new sentence")
+
+    def test_a_paste_that_was_read_restores_the_clipboard_as_before(self):
+        injector, calls = self._x11_injector_with_paste()
+        owner = self._fake_owner(landed=True)
+        restores = []
+        with patch.object(TextInjector, "_paste_injection_enabled", return_value=True):
+            with patch.object(TextInjector, "_selection_owner", return_value=owner):
+                with patch("threading.Thread", side_effect=lambda target=None, **kw: (
+                        restores.append(target), MagicMock())[1]):
+                    with patch("subprocess.Popen") as popen:
+                        self.assertTrue(injector.inject_text("Hello world"))
+        popen.assert_not_called()
+        restores[0]()
+        sets = [kw["input"] for c, kw in calls if c == ["xclip", "-selection", "clipboard"]]
+        self.assertEqual(sets, ["what was on the clipboard"])
+
+    def test_verification_off_keeps_the_old_xclip_path(self):
+        """paste_verify: false gives up the check and goes back to xclip."""
+        injector, calls = self._x11_injector_with_paste()
+        with patch.object(TextInjector, "_paste_injection_enabled", return_value=True):
+            with patch.object(TextInjector, "_paste_verify_enabled", return_value=False):
+                with patch("threading.Thread", return_value=MagicMock()):
+                    self.assertTrue(injector.inject_text("Hello world"))
+        sets = [kw["input"] for c, kw in calls if c == ["xclip", "-selection", "clipboard"]]
+        self.assertEqual(sets, ["Hello world"])
 
     def test_focused_window_identity_reads_wm_class_via_xprop(self):
         """xdotool 3.2016 has no getwindowclassname; WM_CLASS comes from xprop."""

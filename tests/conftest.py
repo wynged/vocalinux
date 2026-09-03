@@ -102,6 +102,24 @@ def _suppress_desktop_notifications(request):
 
 
 @pytest.fixture(autouse=True)
+def _no_real_clipboard_owner(request):
+    """Keep the suite off the real X clipboard.
+
+    Verifying a paste means owning the CLIPBOARD selection for real, and
+    several tests patch DISPLAY to ":0", so without this a test run would
+    take the developer's clipboard away mid-edit. Tests that exercise the
+    detection provide their own fake owner with an inner patch.
+    """
+    if "clipboard_owner" in request.node.nodeid:
+        yield
+        return
+    from vocalinux.text_injection.text_injector import TextInjector
+
+    with patch.object(TextInjector, "_selection_owner", return_value=None):
+        yield
+
+
+@pytest.fixture(autouse=True)
 def _clear_hardware_detection_cache():
     """Clear lru_cache on hardware-detection helpers between tests.
 
