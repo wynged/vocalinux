@@ -270,6 +270,7 @@ def main():
     from .common_types import RecognitionState
     from .speech_recognition import recognition_manager
     from .text_injection import text_injector
+    from .text_injection import compose_sink
     from .ui import tray_indicator
     from .ui.action_handler import ActionHandler
     from .ui.config_manager import ConfigManager
@@ -428,10 +429,23 @@ def main():
             if not text_to_inject:
                 return
 
+            continuing = bool(
+                action_handler.last_injected_text and action_handler.last_injected_text.strip()
+            )
+
+            # A compose window, while one is open, takes every segment before
+            # the focused app gets a look: the text is sent bare, and the
+            # window joins it (a space within one hold of the key, a new
+            # paragraph for a new one). No window, or a broken one, and the
+            # segment is injected exactly as it would have been.
+            if compose_sink.deliver(text_to_inject, new_session=not continuing):
+                action_handler.set_last_injected_text(text)
+                return
+
             # Add a separating space between consecutive dictation segments,
             # but never for the very first segment (avoids unwanted leading space
             # when starting dictation in an empty text field).
-            if action_handler.last_injected_text and action_handler.last_injected_text.strip():
+            if continuing:
                 text_to_inject = " " + text_to_inject
                 logger.debug("Added space separator before new segment")
 
