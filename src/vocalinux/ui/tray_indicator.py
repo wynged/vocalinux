@@ -8,6 +8,8 @@ recognition process and displaying its status.
 import logging
 import os
 import signal
+import threading
+import time
 from typing import Callable, Optional
 
 import gi
@@ -80,6 +82,14 @@ class TrayIndicator:
         self.config_manager = ConfigManager()  # Added: Initialize ConfigManager
         self._syncing_autostart_menu = False
 
+        # Hybrid-mode state: whether hands-free is latched on, and the timer that
+        # holds back the stop of a very short tap long enough to see whether a
+        # second tap is coming.
+        self._hybrid_lock = threading.Lock()
+        self._hybrid_latched = False
+        self._hybrid_press_time = 0.0
+        self._hybrid_stop_timer: Optional[threading.Timer] = None
+
         # Get configured shortcut and mode from config
         shortcut = self.config_manager.get_str("shortcuts", "toggle_recognition", "ctrl+ctrl")
         mode = self.config_manager.get_str("shortcuts", "mode", "toggle")
@@ -143,6 +153,13 @@ class TrayIndicator:
             # Register press/release callbacks for push-to-talk mode
             self.shortcut_manager.register_press_callback(self._start_recognition)
             self.shortcut_manager.register_release_callback(self._stop_recognition)
+        elif mode == "hybrid":
+            # Hold to talk, double-tap to latch hands-free: all three events.
+            self._cancel_hybrid_stop()
+            self._hybrid_latched = False
+            self.shortcut_manager.register_toggle_callback(self._toggle_hands_free)
+            self.shortcut_manager.register_press_callback(self._hybrid_press)
+            self.shortcut_manager.register_release_callback(self._hybrid_release)
 
         # Start the keyboard shortcut manager
         self.shortcut_manager.start()
@@ -327,6 +344,95 @@ class TrayIndicator:
         if self.speech_engine.state != RecognitionState.IDLE:
             self.speech_engine.stop_recognition()
 
+    # --- Hybrid mode -------------------------------------------------------
+    #
+    # A press starts recording straight away, so no first word is ever lost.
+    # A release ends it -- unless the key was held for less than the
+    # double-tap window, in which case the stop waits that long to see whether
+    # a second tap arrives. If one does, the recording that already started
+    # simply carries on as a hands-free session; if it does not, the deferred
+    # stop fires and the tap behaves like an ordinary short push-to-talk.
+
+    @property
+    def _hybrid_tap_window(self) -> float:
+        """The double-tap window the keyboard backend is actually using."""
+        backend = self.shortcut_manager.backend_instance
+        return getattr(backend, "double_tap_threshold", 0.3)
+
+    def _cancel_hybrid_stop(self):
+        """Cancel a deferred push-to-talk stop, if one is pending."""
+        with self._hybrid_lock:
+            timer, self._hybrid_stop_timer = self._hybrid_stop_timer, None
+        if timer is not None:
+            timer.cancel()
+
+    def _hybrid_press(self):
+        """Handle a key press in hybrid mode: begin holding to talk."""
+        self._cancel_hybrid_stop()
+
+        if self._hybrid_latched:
+            # Hands-free is on; the key is free for its normal duties.
+            return
+
+        if self.speech_engine.state != RecognitionState.IDLE:
+            # Already recording (a repeat of the same press). Leave the start
+            # time alone so the hold is measured from when it really began.
+            return
+
+        self._hybrid_press_time = time.time()
+        self._start_recognition()
+
+    def _hybrid_release(self):
+        """Handle a key release in hybrid mode: end the hold, or defer."""
+        if self._hybrid_latched:
+            return
+
+        if self.speech_engine.state == RecognitionState.IDLE:
+            return
+
+        held = time.time() - self._hybrid_press_time
+        if held >= self._hybrid_tap_window:
+            self._stop_recognition()
+            return
+
+        # Too short to be a hold. It may be the first half of a double-tap, so
+        # keep recording until the window has passed rather than stopping now
+        # and having to start again a moment later.
+        delay = self._hybrid_tap_window - held + 0.05
+        logger.debug(f"Hybrid: short tap ({held:.2f}s), deferring stop by {delay:.2f}s")
+        timer = threading.Timer(delay, self._hybrid_deferred_stop)
+        timer.daemon = True
+        with self._hybrid_lock:
+            self._hybrid_stop_timer = timer
+        timer.start()
+
+    def _hybrid_deferred_stop(self):
+        """Fire the stop a short tap deferred, if nothing has superseded it."""
+        with self._hybrid_lock:
+            self._hybrid_stop_timer = None
+        if self._hybrid_latched:
+            return
+        self._stop_recognition()
+
+    def _toggle_hands_free(self):
+        """Latch hands-free recognition on or off (double-tap in hybrid mode)."""
+        self._cancel_hybrid_stop()
+
+        if self._hybrid_latched:
+            self._hybrid_latched = False
+            logger.info("Hands-free dictation off")
+            self._stop_recognition()
+            return
+
+        self._hybrid_latched = True
+        logger.info("Hands-free dictation on")
+        if self.speech_engine.state == RecognitionState.IDLE:
+            self.speech_engine.start_recognition(mode="toggle")
+        else:
+            # The first tap already started recording. Convert that session
+            # instead of restarting, so nothing said so far is thrown away.
+            self.speech_engine.set_recognition_mode("toggle")
+
     def _add_menu_item(self, label: str, callback: Callable):
         """
         Add a menu item to the indicator menu.
@@ -402,6 +508,13 @@ class TrayIndicator:
         Args:
             state: The new recognition state
         """
+        # Anything that ends recognition ends hands-free with it -- suspend, an
+        # error, the tray menu. Without this the latch would survive a stop it
+        # did not ask for and then swallow every subsequent hold of the key.
+        if state in (RecognitionState.IDLE, RecognitionState.ERROR) and self._hybrid_latched:
+            logger.info("Recognition ended elsewhere — clearing the hands-free latch")
+            self._hybrid_latched = False
+
         # Update the UI in the GTK main thread
         GLib.idle_add(self._update_ui, state)
 

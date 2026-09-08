@@ -104,7 +104,7 @@ class PynputKeyboardBackend(KeyboardBackend):
 
         Args:
             shortcut: The shortcut string to listen for (e.g., "ctrl+ctrl")
-            mode: The shortcut mode ("toggle" or "push_to_talk")
+            mode: The shortcut mode ("toggle", "push_to_talk" or "hybrid")
         """
         super().__init__(shortcut, mode)
         self.listener = None
@@ -198,6 +198,14 @@ class PynputKeyboardBackend(KeyboardBackend):
             finally:
                 self.listener = None
 
+    def _is_double_tap(self, current_time: float) -> bool:
+        """Whether this press closes a double-tap on the configured modifier."""
+        return (
+            current_time - self.last_key_press_time < self.double_tap_threshold
+            and self.double_tap_callback is not None
+            and current_time - self.last_trigger_time > 0.5
+        )
+
     def _on_press(self, key) -> None:
         """Handle key press events."""
         try:
@@ -206,14 +214,26 @@ class PynputKeyboardBackend(KeyboardBackend):
             if matched:
                 current_time = time.time()
                 normalized_key = self._normalize_modifier_key(key)
+                # X11 auto-repeat re-delivers on_press while the key is held
+                # down. A repeat is not a new tap: counting one would read a
+                # long hold as a double-tap. Modifiers do not repeat under a
+                # stock XKB map, so this only matters for a rebound key -- and
+                # it deliberately does not suppress the press callback, so a
+                # release we somehow missed cannot leave dictation unable to
+                # start until the key is pressed again.
+                is_repeat = normalized_key in self.current_keys
                 self.current_keys.add(normalized_key)
 
-                if self._mode == "toggle":
-                    if (
-                        current_time - self.last_key_press_time < self.double_tap_threshold
-                        and self.double_tap_callback is not None
-                        and current_time - self.last_trigger_time > 0.5
-                    ):
+                if self._mode == "hybrid":
+                    if self._is_double_tap(current_time) and not is_repeat:
+                        logger.debug(f"Double-tap {self._modifier_key} detected (pynput, hybrid)")
+                        self.last_trigger_time = current_time
+                        threading.Thread(target=self.double_tap_callback, daemon=True).start()
+                    elif self.key_press_callback is not None:
+                        logger.debug(f"Key press {self._modifier_key} detected (pynput, hybrid)")
+                        threading.Thread(target=self.key_press_callback, daemon=True).start()
+                elif self._mode == "toggle":
+                    if self._is_double_tap(current_time) and not is_repeat:
                         logger.debug(f"Double-tap {self._modifier_key} detected (pynput)")
                         self.last_trigger_time = current_time
                         threading.Thread(target=self.double_tap_callback, daemon=True).start()
@@ -222,7 +242,8 @@ class PynputKeyboardBackend(KeyboardBackend):
                         logger.debug(f"Key press {self._modifier_key} detected (pynput)")
                         threading.Thread(target=self.key_press_callback, daemon=True).start()
 
-                self.last_key_press_time = current_time
+                if not is_repeat:
+                    self.last_key_press_time = current_time
         except Exception as e:
             logger.error(f"Error in pynput key press handling: {e}")
 
@@ -234,7 +255,7 @@ class PynputKeyboardBackend(KeyboardBackend):
             self.current_keys.discard(normalized_key)
             matched = self._matches_configured_modifier(key)
 
-            if self._mode == "push_to_talk" and matched:
+            if self._mode in ("push_to_talk", "hybrid") and matched:
                 if self.key_release_callback is not None:
                     logger.debug(f"Key release {self._modifier_key} detected (pynput)")
                     threading.Thread(target=self.key_release_callback, daemon=True).start()

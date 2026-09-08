@@ -146,7 +146,7 @@ class EvdevKeyboardBackend(KeyboardBackend):
 
         Args:
             shortcut: The shortcut string to listen for (e.g., "ctrl+ctrl")
-            mode: The shortcut mode ("toggle" or "push_to_talk")
+            mode: The shortcut mode ("toggle", "push_to_talk" or "hybrid")
         """
         super().__init__(shortcut, mode)
         self.devices: list[InputDevice] = []
@@ -164,6 +164,14 @@ class EvdevKeyboardBackend(KeyboardBackend):
 
         if not EVDEV_AVAILABLE:
             logger.error("python-evdev not available")
+
+    def _is_double_tap(self, current_time: float) -> bool:
+        """Whether this press closes a double-tap on the configured modifier."""
+        return (
+            current_time - self.last_key_press_time < self.double_tap_threshold
+            and self.double_tap_callback is not None
+            and current_time - self.last_trigger_time > 0.5
+        )
 
     def _get_target_key_codes(self) -> set[int]:
         """Get the evdev key codes for the configured modifier."""
@@ -387,13 +395,21 @@ class EvdevKeyboardBackend(KeyboardBackend):
                     self.key_pressed_devices.add(device_id)
                     current_time = time.time()
 
-                    if self._mode == "toggle":
+                    if self._mode == "hybrid":
+                        # One press is either the close of a double-tap or the
+                        # start of a hold, never both.
+                        if self._is_double_tap(current_time):
+                            logger.debug(
+                                f"Double-tap {self._modifier_key} detected (evdev, hybrid)"
+                            )
+                            self.last_trigger_time = current_time
+                            threading.Thread(target=self.double_tap_callback, daemon=True).start()
+                        elif self.key_press_callback is not None:
+                            logger.debug(f"Key press {self._modifier_key} detected (evdev, hybrid)")
+                            threading.Thread(target=self.key_press_callback, daemon=True).start()
+                    elif self._mode == "toggle":
                         # Check for double-tap
-                        if (
-                            current_time - self.last_key_press_time < self.double_tap_threshold
-                            and self.double_tap_callback is not None
-                            and current_time - self.last_trigger_time > 0.5
-                        ):
+                        if self._is_double_tap(current_time):
                             logger.debug(f"Double-tap {self._modifier_key} detected (evdev)")
                             self.last_trigger_time = current_time
                             threading.Thread(target=self.double_tap_callback, daemon=True).start()
@@ -408,7 +424,7 @@ class EvdevKeyboardBackend(KeyboardBackend):
                 elif value == 0:  # Key release
                     self.key_pressed_devices.discard(device_id)
 
-                    if self._mode == "push_to_talk":
+                    if self._mode in ("push_to_talk", "hybrid"):
                         # Trigger on release
                         if self.key_release_callback is not None:
                             logger.debug(f"Key release {self._modifier_key} detected (evdev)")

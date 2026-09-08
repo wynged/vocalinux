@@ -52,7 +52,7 @@ class KeyboardShortcutManager:
 
     This class allows registering configurable shortcuts to
     toggle voice typing on and off across the desktop environment.
-    Supports both toggle (double-tap) and push-to-talk modes.
+    Supports toggle (double-tap), push-to-talk, and hybrid modes.
 
     Automatically selects the appropriate backend based on the
     desktop environment (X11, Wayland) and available dependencies.
@@ -71,7 +71,7 @@ class KeyboardShortcutManager:
             backend: Optional backend name to force ('pynput' or 'evdev')
                     If not specified, auto-detects based on environment.
             shortcut: The shortcut to listen for (e.g., "ctrl+ctrl", "alt+alt")
-            mode: The shortcut mode ("toggle" or "push_to_talk")
+            mode: The shortcut mode ("toggle", "push_to_talk" or "hybrid")
         """
         self.backend_instance = None
         self.active = False
@@ -128,7 +128,7 @@ class KeyboardShortcutManager:
         Note: This requires restarting the listener to take effect.
 
         Args:
-            mode: The new mode ("toggle" or "push_to_talk")
+            mode: The new mode ("toggle", "push_to_talk" or "hybrid")
 
         Returns:
             True if successful, False if the mode is invalid
@@ -185,7 +185,8 @@ class KeyboardShortcutManager:
 
         Args:
             shortcut: The new shortcut string (e.g., "ctrl+ctrl", "alt+alt")
-            mode: Optional new mode ("toggle" or "push_to_talk"). If None, keeps current mode.
+            mode: Optional new mode ("toggle", "push_to_talk" or "hybrid").
+                  If None, keeps current mode.
 
         Returns:
             True if the listener was successfully restarted with the new shortcut,
@@ -237,9 +238,9 @@ class KeyboardShortcutManager:
             self.register_release_callback(None)
 
             # Re-register callbacks based on current mode
-            if self._mode == "toggle" and toggle_callback:
+            if self._mode in ("toggle", "hybrid") and toggle_callback:
                 self.register_toggle_callback(toggle_callback)
-            elif self._mode == "push_to_talk":
+            if self._mode in ("push_to_talk", "hybrid"):
                 if press_callback:
                     self.register_press_callback(press_callback)
                 if release_callback:

@@ -1369,7 +1369,7 @@ class SettingsDialog(Gtk.Dialog):
         self.shortcut_mode_combo = Gtk.ComboBoxText()
         self.shortcut_mode_combo.set_size_request(200, -1)
         self.shortcut_mode_combo.set_tooltip_text(
-            "Choose between toggle (double-tap) or push-to-talk mode"
+            "Choose between toggle (double-tap), push-to-talk, or both at once (hybrid)"
         )
         _prevent_scroll_on_hover(self.shortcut_mode_combo)
 
@@ -1458,6 +1458,12 @@ class SettingsDialog(Gtk.Dialog):
             self.shortcut_row.set_subtitle("Hold this key to speak, release to stop")
             self.shortcut_info_label.set_text(
                 "In Push-to-Talk mode: Hold the key down to speak, release to stop recording."
+            )
+        elif mode == "hybrid":
+            self.shortcut_row.set_subtitle("Hold this key to speak; double-tap for hands-free")
+            self.shortcut_info_label.set_text(
+                "In Hybrid mode: Hold the key down to speak and release to stop, or "
+                "double-tap it to keep recording hands-free until you double-tap again."
             )
 
     def _on_shortcut_mode_changed(self, widget):

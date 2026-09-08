@@ -2118,6 +2118,23 @@ class SpeechRecognitionManager:
         self.recognition_thread.daemon = True
         self.recognition_thread.start()
 
+    def set_recognition_mode(self, mode: str):
+        """
+        Change the recognition mode of the session that is already running.
+
+        The mode only decides what a silence does: "push_to_talk" holds the
+        buffer until the key is released, anything else flushes it for
+        transcription. Flipping it mid-session is what lets a held-key
+        dictation become hands-free without dropping the audio recorded so far.
+
+        Args:
+            mode: The new mode ("toggle" or "push_to_talk")
+        """
+        if mode == self._recognition_mode:
+            return
+        logger.info(f"Recognition mode changed mid-session: {self._recognition_mode} -> {mode}")
+        self._recognition_mode = mode
+
     def stop_recognition(self):
         """Stop the speech recognition process."""
         if self.state == RecognitionState.IDLE:
