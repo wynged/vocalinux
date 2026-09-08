@@ -34,6 +34,7 @@ from ..common_types import RecognitionState, SpeechRecognitionManagerProtocol, T
 from ..suspend_handler import SuspendHandler
 from ..utils.resource_manager import ResourceManager
 from .config_manager import ConfigManager
+from .keyboard_backends import SHORTCUT_MODES
 from .keyboard_shortcuts import KeyboardShortcutManager
 from .settings_dialog import SettingsDialog
 
@@ -160,6 +161,17 @@ class TrayIndicator:
             self.shortcut_manager.register_toggle_callback(self._toggle_hands_free)
             self.shortcut_manager.register_press_callback(self._hybrid_press)
             self.shortcut_manager.register_release_callback(self._hybrid_release)
+        else:
+            # A mode this build does not know -- a typo, or a config written by
+            # a newer version. Falling through would register nothing at all and
+            # leave the key silently dead, which looks exactly like a broken
+            # install; hold-to-talk is the safe thing to land on instead.
+            logger.warning(
+                f"Unknown shortcut mode {mode!r}; falling back to push-to-talk. "
+                f"Known modes: {', '.join(SHORTCUT_MODES)}"
+            )
+            self.shortcut_manager.register_press_callback(self._start_recognition)
+            self.shortcut_manager.register_release_callback(self._stop_recognition)
 
         # Start the keyboard shortcut manager
         self.shortcut_manager.start()

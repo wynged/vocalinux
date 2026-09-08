@@ -211,6 +211,19 @@ class TestHybridLatch(unittest.TestCase):
         ksm.register_press_callback.assert_called_with(self.tray._hybrid_press)
         ksm.register_release_callback.assert_called_with(self.tray._hybrid_release)
 
+    def test_unknown_mode_falls_back_to_push_to_talk(self):
+        """A mode this build does not know must not leave the key dead."""
+        self.mock_config.get_str.side_effect = lambda section, key, default=None: (
+            "some_future_mode" if key == "mode" else "left_alt+left_alt"
+        )
+        ksm = self.tray.shortcut_manager
+        ksm.reset_mock()
+
+        self.tray._setup_keyboard_shortcuts()
+
+        ksm.register_press_callback.assert_called_with(self.tray._start_recognition)
+        ksm.register_release_callback.assert_called_with(self.tray._stop_recognition)
+
     def test_hold_records_then_stops_on_release(self):
         self.tray._hybrid_press()
         self.assertEqual(self.engine.state, self.RecognitionState.LISTENING)
