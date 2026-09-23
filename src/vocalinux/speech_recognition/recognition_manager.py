@@ -776,6 +776,10 @@ class SpeechRecognitionManager:
         self.whispercpp_logprob_thold = kwargs.get("whispercpp_logprob_thold", -1.0)
         self.whispercpp_no_speech_thold = kwargs.get("whispercpp_no_speech_thold", 0.6)
         self.whispercpp_n_threads = kwargs.get("whispercpp_n_threads", None)
+        # Seconds of idle before the model is touched to keep it in VRAM; 0 disables
+        self.whispercpp_keep_warm_seconds = kwargs.get("whispercpp_keep_warm_seconds", 60)
+        self._last_model_use = time.monotonic()
+        self._keep_warm_thread = None
 
         # Remote API settings
         self.remote_api_url = kwargs.get("remote_api_url", "")
@@ -1233,6 +1237,90 @@ class SpeechRecognitionManager:
 
         self._model_initialized = True
         logger.info("whisper.cpp engine initialized successfully.")
+        self._last_model_use = time.monotonic()
+        self._start_keep_warm()
+
+    def _start_keep_warm(self):
+        """Start the thread that keeps the whisper.cpp model resident in VRAM, once."""
+        if not self.whispercpp_keep_warm_seconds or self.whispercpp_keep_warm_seconds <= 0:
+            return
+        if self._keep_warm_thread is not None and self._keep_warm_thread.is_alive():
+            return
+        self._keep_warm_thread = threading.Thread(
+            target=self._keep_warm_loop, name="whispercpp-keep-warm", daemon=True
+        )
+        self._keep_warm_thread.start()
+        logger.info(
+            f"whisper.cpp keep-warm: touching the model after "
+            f"{self.whispercpp_keep_warm_seconds}s idle to keep it in VRAM"
+        )
+
+    def _keep_warm_loop(self):
+        """Touch the model whenever it has sat idle, so the GPU driver never evicts it.
+
+        amdgpu evicts VRAM least-recently-used first, and a dictation model idles
+        between uses, so it is the first thing pushed out whenever another app wants
+        room. Evicted buffers land in system RAM (GTT) and stay there while VRAM is
+        full: measured 2026-09-23, half the medium model was in GTT and inference ran
+        5-8x slower until a restart. Any GPU submission from this process marks all
+        of its buffers as used, so one second of silence through the model is enough.
+
+        The beat passes no decode params: pywhispercpp keeps overrides for later calls.
+        """
+        import numpy as np
+
+        silence = np.zeros(16000, dtype=np.float32)
+        whisper_logger = logging.getLogger("pywhispercpp.model")
+        fastest = None
+        warned = False
+
+        while True:
+            interval = self.whispercpp_keep_warm_seconds
+            if not interval or interval <= 0:
+                return
+            idle = time.monotonic() - self._last_model_use
+            if idle < interval:
+                time.sleep(interval - idle)
+                continue
+            if self.engine != "whisper_cpp" or self.state != RecognitionState.IDLE:
+                time.sleep(interval)
+                continue
+            # A dictation holds the lock; it is using the model anyway
+            if not self._model_lock.acquire(blocking=False):
+                time.sleep(1)
+                continue
+            try:
+                if self.model is None:
+                    self._last_model_use = time.monotonic()
+                    continue
+                level = whisper_logger.level
+                whisper_logger.setLevel(logging.WARNING)
+                try:
+                    start = time.monotonic()
+                    self.model.transcribe(silence)
+                    took = time.monotonic() - start
+                finally:
+                    whisper_logger.setLevel(level)
+                self._last_model_use = time.monotonic()
+            except Exception as e:
+                logger.warning(f"whisper.cpp keep-warm beat failed: {e}")
+                self._last_model_use = time.monotonic()
+                continue
+            finally:
+                self._model_lock.release()
+
+            fastest = took if fastest is None else min(fastest, took)
+            logger.debug(f"whisper.cpp keep-warm beat took {took:.3f}s")
+            if took > max(1.0, 3 * fastest):
+                if not warned:
+                    logger.warning(
+                        f"whisper.cpp keep-warm beat took {took:.2f}s (fastest {fastest:.2f}s): "
+                        "the model may have been pushed out of VRAM"
+                    )
+                    warned = True
+            elif warned:
+                logger.info(f"whisper.cpp keep-warm beat back to {took:.2f}s")
+                warned = False
 
     def _handle_gpu_fallback(self, error, model_path: str, model_kwargs: dict, cpu_backend):
         """Handle GPU backend failure by falling back to CPU.
@@ -1324,6 +1412,7 @@ class SpeechRecognitionManager:
                 transcribe_start = time.time()
                 segments = self.model.transcribe(audio_float, language=lang)
                 transcribe_duration = time.time() - transcribe_start
+                self._last_model_use = time.monotonic()
 
             # Extract text from segments, filtering non-speech tokens
             text_parts = []
@@ -2744,6 +2833,11 @@ class SpeechRecognitionManager:
             if param_name in kwargs:
                 setattr(self, param_name, kwargs[param_name])
                 restart_needed = True
+
+        if "whispercpp_keep_warm_seconds" in kwargs:
+            self.whispercpp_keep_warm_seconds = kwargs["whispercpp_keep_warm_seconds"]
+            if self.engine == "whisper_cpp" and self.model is not None:
+                self._start_keep_warm()
 
         # Handle Remote API settings
         if "remote_api_url" in kwargs:
