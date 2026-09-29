@@ -43,6 +43,7 @@ def _make_manager(interval=0.05):
     manager.whispercpp_keep_warm_seconds = interval
     manager._last_model_use = time.monotonic() - interval
     manager._keep_warm_thread = None
+    manager._model_on_gpu = True
     return manager
 
 
@@ -101,3 +102,11 @@ def test_a_failed_beat_does_not_kill_the_heartbeat():
     _run_briefly(manager)
     assert manager.model.transcribe.call_count >= 2
     assert not manager._model_lock.locked()
+
+
+def test_a_cpu_model_gets_no_heartbeat():
+    # Nothing to evict from VRAM; the beat would only burn CPU on a laptop battery
+    manager = _make_manager()
+    manager._model_on_gpu = False
+    manager._start_keep_warm()
+    assert manager._keep_warm_thread is None

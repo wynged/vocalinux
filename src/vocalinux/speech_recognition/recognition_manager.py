@@ -1235,6 +1235,9 @@ class SpeechRecognitionManager:
             )
         logger.info(f"whisper.cpp model loaded in {load_duration:.2f}s ({loaded_backend} backend)")
 
+        # has_gpu_libs, not `backend`: the hardware probe names a GPU it can see even
+        # when the pywhispercpp build has no GPU library to run on it
+        self._model_on_gpu = has_gpu_libs and loaded_backend != ComputeBackend.CPU
         self._model_initialized = True
         logger.info("whisper.cpp engine initialized successfully.")
         self._last_model_use = time.monotonic()
@@ -1243,6 +1246,10 @@ class SpeechRecognitionManager:
     def _start_keep_warm(self):
         """Start the thread that keeps the whisper.cpp model resident in VRAM, once."""
         if not self.whispercpp_keep_warm_seconds or self.whispercpp_keep_warm_seconds <= 0:
+            return
+        # A CPU model has no VRAM to lose; beating it would only burn CPU (and battery)
+        if not getattr(self, "_model_on_gpu", False):
+            logger.info("whisper.cpp keep-warm: off, the model is not on a GPU")
             return
         if self._keep_warm_thread is not None and self._keep_warm_thread.is_alive():
             return
