@@ -640,6 +640,66 @@ def _show_notification(title: str, message: str, icon: str = "dialog-warning"):
         logger.debug(f"Could not show notification: {e}")
 
 
+def _gpu_memory_residency(fdinfo_dir: str = "/proc/self/fdinfo") -> Optional[tuple[str, int, int]]:
+    """Where this process's GPU buffers live: (pci device, VRAM KiB, GTT KiB).
+
+    Read from the DRM fdinfo the kernel keeps per open GPU client. Several fds can
+    share one client (the same numbers repeated), so clients are counted once by
+    (device, client id). Returns the device holding the most memory, or None when
+    the driver reports no VRAM/GTT split (not amdgpu, or no GPU client at all).
+    """
+    clients = {}
+    try:
+        names = os.listdir(fdinfo_dir)
+    except OSError:
+        return None
+    for name in names:
+        try:
+            with open(os.path.join(fdinfo_dir, name)) as f:
+                text = f.read()
+        except OSError:
+            continue
+        if "drm-client-id" not in text:
+            continue
+        fields = {}
+        for line in text.splitlines():
+            key, _, value = line.partition(":")
+            fields[key.strip()] = value.strip()
+        # drm-resident-* is the current name; older kernels only have drm-memory-*
+        vram = fields.get("drm-resident-vram", fields.get("drm-memory-vram"))
+        gtt = fields.get("drm-resident-gtt", fields.get("drm-memory-gtt"))
+        if vram is None or gtt is None:
+            continue
+        try:
+            clients[(fields.get("drm-pdev", ""), fields["drm-client-id"])] = (
+                int(vram.split()[0]),
+                int(gtt.split()[0]),
+            )
+        except (ValueError, IndexError):
+            continue
+    if not clients:
+        return None
+    per_device = {}
+    for (pdev, _), (vram, gtt) in clients.items():
+        v, g = per_device.get(pdev, (0, 0))
+        per_device[pdev] = (v + vram, g + gtt)
+    pdev, (vram, gtt) = max(per_device.items(), key=lambda item: sum(item[1]))
+    return pdev, vram, gtt
+
+
+def _free_vram_kib(pdev: str, sysfs_root: str = "/sys/bus/pci/devices") -> Optional[int]:
+    """Free VRAM on a PCI GPU in KiB, from amdgpu's sysfs counters; None if unknown."""
+    try:
+        base = os.path.join(sysfs_root, pdev)
+        with open(os.path.join(base, "mem_info_vram_total")) as f:
+            total = int(f.read())
+        with open(os.path.join(base, "mem_info_vram_used")) as f:
+            used = int(f.read())
+    except (OSError, ValueError):
+        return None
+    return max(0, total - used) // 1024
+
+
 # Define constants
 MODELS_DIR = os.path.expanduser("~/.local/share/vocalinux/models")
 
@@ -780,6 +840,9 @@ class SpeechRecognitionManager:
         self.whispercpp_keep_warm_seconds = kwargs.get("whispercpp_keep_warm_seconds", 60)
         self._last_model_use = time.monotonic()
         self._keep_warm_thread = None
+        # What the model was built from, so the heartbeat can rebuild it in VRAM
+        self._whispercpp_model_path = None
+        self._whispercpp_model_kwargs = None
 
         # Remote API settings
         self.remote_api_url = kwargs.get("remote_api_url", "")
@@ -1238,6 +1301,8 @@ class SpeechRecognitionManager:
         # has_gpu_libs, not `backend`: the hardware probe names a GPU it can see even
         # when the pywhispercpp build has no GPU library to run on it
         self._model_on_gpu = has_gpu_libs and loaded_backend != ComputeBackend.CPU
+        self._whispercpp_model_path = model_path
+        self._whispercpp_model_kwargs = model_kwargs
         self._model_initialized = True
         logger.info("whisper.cpp engine initialized successfully.")
         self._last_model_use = time.monotonic()
@@ -1328,6 +1393,89 @@ class SpeechRecognitionManager:
             elif warned:
                 logger.info(f"whisper.cpp keep-warm beat back to {took:.2f}s")
                 warned = False
+
+            self._reload_if_spilled()
+
+    # A model counts as spilled once this much of it sits in GTT (KiB, fraction)
+    _SPILL_MIN_KIB = 128 * 1024
+    _SPILL_MIN_FRACTION = 0.10
+    # Free VRAM needed beyond the spilled part before a reload is worth trying
+    _RELOAD_HEADROOM_KIB = 256 * 1024
+    # Wait between reloads that did not bring the model back, doubling to the cap
+    _RELOAD_BACKOFF_SECONDS = 600
+    _RELOAD_BACKOFF_MAX_SECONDS = 3600
+
+    def _reload_if_spilled(self):
+        """Rebuild the model when part of it is in system RAM and VRAM has room again.
+
+        The heartbeat keeps a resident model resident, but amdgpu never moves an
+        evicted buffer back while it is in use, so a model that is already partly in
+        GTT stays there: at login the model loads while Chrome and voicecapture are
+        filling VRAM, and came up with 1 GiB in GTT, slow from the first dictation
+        (2026-09-29). Freeing it and loading again is the only way back. Only done
+        when the free VRAM covers the spilled part, or the new copy would spill too.
+        """
+        residency = _gpu_memory_residency()
+        if residency is None:
+            return
+        pdev, vram, gtt = residency
+        if gtt < self._SPILL_MIN_KIB or gtt < self._SPILL_MIN_FRACTION * (vram + gtt):
+            return
+        now = time.monotonic()
+        if now < getattr(self, "_next_vram_reload_at", 0.0):
+            return
+        free = _free_vram_kib(pdev)
+        if free is None or free < gtt + self._RELOAD_HEADROOM_KIB:
+            logger.debug(
+                f"whisper.cpp model has {gtt // 1024} MiB in system RAM; "
+                f"{'unknown' if free is None else free // 1024} MiB VRAM free, not enough to reload"
+            )
+            return
+        if self._whispercpp_model_path is None or self._whispercpp_model_kwargs is None:
+            return
+        if not self._model_lock.acquire(blocking=False):
+            return
+        try:
+            if self.model is None or self.state != RecognitionState.IDLE:
+                return
+            logger.warning(
+                f"whisper.cpp model has {gtt // 1024} MiB of {(vram + gtt) // 1024} MiB in "
+                f"system RAM and {free // 1024} MiB VRAM is free: reloading it into VRAM"
+            )
+            start = time.monotonic()
+            self.model = None
+            import gc
+
+            gc.collect()
+            try:
+                self.model = self._load_model_with_compatible_params(
+                    self._whispercpp_model_path, self._whispercpp_model_kwargs
+                )
+            except Exception as e:
+                logger.error(f"whisper.cpp reload into VRAM failed: {e}")
+                _show_notification(
+                    "Vocalinux: model reload failed",
+                    "Dictation is unavailable until Vocalinux is restarted.",
+                )
+                return
+            self._last_model_use = time.monotonic()
+            took = time.monotonic() - start
+        finally:
+            self._model_lock.release()
+
+        after = _gpu_memory_residency()
+        backoff = getattr(self, "_vram_reload_backoff", self._RELOAD_BACKOFF_SECONDS)
+        if after is not None and after[2] >= self._SPILL_MIN_KIB:
+            logger.warning(
+                f"whisper.cpp reloaded in {took:.2f}s but {after[2] // 1024} MiB is still in "
+                f"system RAM; next try in {backoff // 60} min"
+            )
+            self._next_vram_reload_at = time.monotonic() + backoff
+            self._vram_reload_backoff = min(2 * backoff, self._RELOAD_BACKOFF_MAX_SECONDS)
+        else:
+            logger.info(f"whisper.cpp model reloaded into VRAM in {took:.2f}s")
+            self._next_vram_reload_at = time.monotonic() + self._RELOAD_BACKOFF_SECONDS
+            self._vram_reload_backoff = self._RELOAD_BACKOFF_SECONDS
 
     def _handle_gpu_fallback(self, error, model_path: str, model_kwargs: dict, cpu_backend):
         """Handle GPU backend failure by falling back to CPU.

@@ -29,6 +29,7 @@ if "gi.repository" not in sys.modules:
     sys.modules["gi.repository"] = MagicMock()
 
 from vocalinux.common_types import RecognitionState  # noqa: E402
+from vocalinux.speech_recognition import recognition_manager as rm  # noqa: E402
 from vocalinux.speech_recognition.recognition_manager import (  # noqa: E402
     SpeechRecognitionManager,
 )
@@ -44,6 +45,8 @@ def _make_manager(interval=0.05):
     manager._last_model_use = time.monotonic() - interval
     manager._keep_warm_thread = None
     manager._model_on_gpu = True
+    manager._whispercpp_model_path = "/models/ggml-medium.bin"
+    manager._whispercpp_model_kwargs = {"n_threads": 4}
     return manager
 
 
@@ -110,3 +113,112 @@ def test_a_cpu_model_gets_no_heartbeat():
     manager._model_on_gpu = False
     manager._start_keep_warm()
     assert manager._keep_warm_thread is None
+
+
+MIB = 1024
+
+
+def _fdinfo(client_id, vram_kib, gtt_kib, pdev="0000:2d:00.0"):
+    return (
+        "pos:\t0\nflags:\t02100002\ndrm-driver:\tamdgpu\n"
+        f"drm-client-id:\t{client_id}\ndrm-pdev:\t{pdev}\n"
+        f"drm-resident-gtt:\t{gtt_kib} KiB\ndrm-resident-vram:\t{vram_kib} KiB\n"
+    )
+
+
+def test_residency_counts_a_client_shared_by_several_fds_once(tmp_path):
+    (tmp_path / "0").write_text("pos:\t0\nflags:\t0100000\n")
+    (tmp_path / "11").write_text(_fdinfo(439, 864212, 1048192))
+    (tmp_path / "12").write_text(_fdinfo(439, 864212, 1048192))
+    assert rm._gpu_memory_residency(str(tmp_path)) == ("0000:2d:00.0", 864212, 1048192)
+
+
+def test_residency_is_none_without_a_vram_gtt_split(tmp_path):
+    (tmp_path / "0").write_text("pos:\t0\n")
+    (tmp_path / "1").write_text(
+        "drm-driver:\ti915\ndrm-client-id:\t3\ndrm-total-system0:\t5 KiB\n"
+    )
+    assert rm._gpu_memory_residency(str(tmp_path)) is None
+
+
+def test_free_vram_reads_amdgpu_sysfs(tmp_path):
+    dev = tmp_path / "0000:2d:00.0"
+    dev.mkdir()
+    (dev / "mem_info_vram_total").write_text(str(8 * 1024**3))
+    (dev / "mem_info_vram_used").write_text(str(5 * 1024**3))
+    assert rm._free_vram_kib("0000:2d:00.0", str(tmp_path)) == 3 * 1024 * MIB
+    assert rm._free_vram_kib("0000:99:00.0", str(tmp_path)) is None
+
+
+def _spilled(monkeypatch, manager, free_kib, after_gtt=2 * MIB):
+    old = manager.model
+    readings = iter(
+        [("0000:2d:00.0", 864 * MIB, 1024 * MIB), ("0000:2d:00.0", 1900 * MIB, after_gtt)]
+    )
+    monkeypatch.setattr(rm, "_gpu_memory_residency", lambda: next(readings))
+    monkeypatch.setattr(rm, "_free_vram_kib", lambda pdev: free_kib)
+    new = MagicMock()
+    manager._load_model_with_compatible_params = MagicMock(return_value=new)
+    return old, new
+
+
+def test_a_spilled_model_is_reloaded_when_vram_has_room(monkeypatch):
+    manager = _make_manager()
+    old, new = _spilled(monkeypatch, manager, free_kib=3000 * MIB)
+    manager._reload_if_spilled()
+    manager._load_model_with_compatible_params.assert_called_once_with(
+        "/models/ggml-medium.bin", {"n_threads": 4}
+    )
+    assert manager.model is new
+    assert not manager._model_lock.locked()
+
+
+def test_a_spilled_model_is_left_alone_while_vram_is_full(monkeypatch):
+    # Reloading now would only land the new copy in system RAM as well
+    manager = _make_manager()
+    old, _ = _spilled(monkeypatch, manager, free_kib=900 * MIB)
+    manager._reload_if_spilled()
+    manager._load_model_with_compatible_params.assert_not_called()
+    assert manager.model is old
+
+
+def test_no_reload_while_dictating(monkeypatch):
+    manager = _make_manager()
+    manager.state = RecognitionState.LISTENING
+    old, _ = _spilled(monkeypatch, manager, free_kib=3000 * MIB)
+    manager._reload_if_spilled()
+    manager._load_model_with_compatible_params.assert_not_called()
+    assert manager.model is old
+
+
+def test_a_resident_model_is_not_reloaded(monkeypatch):
+    manager = _make_manager()
+    resident = ("0000:2d:00.0", 1900 * MIB, 2 * MIB)
+    monkeypatch.setattr(rm, "_gpu_memory_residency", lambda: resident)
+    monkeypatch.setattr(rm, "_free_vram_kib", lambda pdev: 3000 * MIB)
+    manager._load_model_with_compatible_params = MagicMock()
+    manager._reload_if_spilled()
+    manager._load_model_with_compatible_params.assert_not_called()
+
+
+def test_a_reload_that_still_spills_backs_off(monkeypatch):
+    manager = _make_manager()
+    _spilled(monkeypatch, manager, free_kib=3000 * MIB, after_gtt=1024 * MIB)
+    manager._reload_if_spilled()
+    assert manager._next_vram_reload_at > time.monotonic() + 500
+    assert manager._vram_reload_backoff == 2 * SpeechRecognitionManager._RELOAD_BACKOFF_SECONDS
+    # Still spilled on the next beat, but inside the backoff: no second reload
+    _spilled(monkeypatch, manager, free_kib=3000 * MIB)
+    manager._reload_if_spilled()
+    manager._load_model_with_compatible_params.assert_not_called()
+
+
+def test_a_failed_reload_releases_the_lock(monkeypatch):
+    manager = _make_manager()
+    _spilled(monkeypatch, manager, free_kib=3000 * MIB)
+    manager._load_model_with_compatible_params.side_effect = RuntimeError("vk oom")
+    monkeypatch.setattr(rm, "_show_notification", MagicMock())
+    manager._reload_if_spilled()
+    assert manager.model is None
+    assert not manager._model_lock.locked()
+    rm._show_notification.assert_called_once()
