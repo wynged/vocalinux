@@ -104,6 +104,12 @@ class TextInjector:
     application window, supporting both X11 and Wayland environments.
     """
 
+    # Set when the window a dictation was meant for has lost focus: what is
+    # still being transcribed is parked on the clipboard instead of pasted into
+    # whatever has focus now. See divert_to_clipboard. A class default, so it
+    # is never missing from the hot path of inject_text.
+    _diverted = False
+
     def __init__(self, wayland_mode: bool = False):
         """
         Initialize the text injector.
@@ -784,6 +790,10 @@ class TextInjector:
             logger.debug("Empty text provided, skipping injection")
             return True
 
+        if self._diverted:
+            self._park_on_clipboard(text)
+            return True
+
         # Per-app blocklist: in apps like Gather, single keystrokes are commands
         # (movement, interactions), so typing a dictated sentence fires a flurry
         # of shortcuts. When the focused window matches the user's blocklist,
@@ -1126,7 +1136,9 @@ class TextInjector:
             return None
         return unlanded
 
-    def _handle_paste_that_did_not_land(self, text: str, generation: int, previous, owner):
+    def _handle_paste_that_did_not_land(
+        self, text: str, generation: int, previous, owner, notice=None
+    ):
         """Nothing read the clipboard, so the text went nowhere. Leave it there.
 
         A dictation arrives as several segments whenever the speaker pauses,
@@ -1153,10 +1165,61 @@ class TextInjector:
 
         now = time.monotonic()
         if now - self._last_no_target_notify_ts > 4.0:
-            self._notify_paste_did_not_land()
+            self._notify_paste_did_not_land(*(notice or ()))
             self._last_no_target_notify_ts = now
 
-    def _notify_paste_did_not_land(self):
+    def divert_to_clipboard(self) -> None:
+        """Park every segment on the clipboard until end_divert() is called.
+
+        For a dictation whose window has lost focus: the speaker has moved on,
+        but the last thing they said is still being transcribed, and pasting it
+        into the window they moved to is exactly wrong. Dropping it would be
+        wrong too, so it waits on the clipboard for them to place by hand.
+        """
+        self._diverted = True
+
+    def end_divert(self) -> None:
+        """Go back to pasting into the focused window."""
+        self._diverted = False
+
+    def _park_on_clipboard(self, text: str) -> None:
+        """Put a segment on the clipboard, after any already parked, and say so."""
+        text = text.strip()
+        logger.info(f"Window changed mid-dictation; parking {len(text)} chars on the clipboard")
+        notice = (
+            "Dictation is on the clipboard",
+            "You switched windows before it finished \u2014 press Ctrl+V where you want it.",
+        )
+        owner = self._selection_owner()
+        if owner is None:
+            if self._copy_to_clipboard(text):
+                self._notify_paste_did_not_land(*notice)
+            return
+
+        env = os.environ.copy()
+        with self._paste_lock:
+            self._paste_generation += 1  # an older segment's restore must not undo this
+            generation = self._paste_generation
+            unlanded = self._live_unlanded()
+            if self._paste_pending_restore is not None:
+                previous = self._paste_pending_restore[1]
+            elif unlanded is not None:
+                previous = unlanded[1]
+            else:
+                previous = self._read_x11_clipboard(env)
+            self._paste_pending_restore = None
+        # With nothing parked yet the text has to go on the clipboard here; with
+        # something parked, the handler below appends to it.
+        if unlanded is None and not owner.set_text(text):
+            logger.warning("Could not park dictation on the clipboard; it is lost")
+            return
+        self._handle_paste_that_did_not_land(text, generation, previous, owner, notice)
+
+    def _notify_paste_did_not_land(
+        self,
+        title: str = "Nowhere to paste",
+        body: str = "The text couldn't find a place to land \u2014 press Ctrl+V where you want it.",
+    ):
         """Tell the user their words are on the clipboard and where to put them."""
         try:
             subprocess.Popen(
@@ -1166,9 +1229,8 @@ class TextInjector:
                     "edit-paste",
                     "-a",
                     "Vocalinux",
-                    "Nowhere to paste",
-                    "The text couldn't find a place to land \u2014 "
-                    "press Ctrl+V where you want it.",
+                    title,
+                    body,
                 ],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,

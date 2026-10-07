@@ -1460,7 +1460,7 @@ class SettingsDialog(Gtk.Dialog):
                 "In Push-to-Talk mode: Hold the key down to speak, release to stop recording."
             )
         elif mode == "hybrid":
-            self.shortcut_row.set_subtitle("Hold this key to speak; double-tap for hands-free")
+            self.shortcut_row.set_subtitle("Hold this key to speak; tap once for one thought; double-tap for hands-free")
             self.shortcut_info_label.set_text(
                 "In Hybrid mode: Hold the key down to speak and release to stop, or "
                 "double-tap it to keep recording hands-free until you double-tap again."

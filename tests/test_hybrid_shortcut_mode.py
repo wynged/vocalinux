@@ -2,8 +2,9 @@
 Tests for hybrid shortcut mode.
 
 Hybrid mode is push-to-talk and toggle at once on a single key: hold it to
-speak, or double-tap it to latch hands-free dictation on until the next
-double-tap. These tests cover the two halves separately --
+speak, tap it once to dictate one thought (until a long quiet, a change of
+window or the next tap), or double-tap it to latch hands-free dictation on
+until the next double-tap. These tests cover the two halves separately --
 
 - the keyboard backend, which decides whether a press is the start of a hold
   or the close of a double-tap, and
@@ -110,6 +111,31 @@ class TestHybridBackendRouting(unittest.TestCase):
 
         self.assertEqual(events.count("toggle"), 0)
 
+    def test_another_key_during_the_hold_marks_it_chorded(self):
+        backend, key = _hybrid_backend()
+        other = MagicMock(name="tab")
+        _record(backend)
+
+        backend._on_press(key)
+        backend._matches_configured_modifier = lambda k: k is key
+        backend._normalize_modifier_key = lambda k: k
+        backend._on_press(other)
+        self.assertTrue(backend.chorded)
+
+        backend._on_release(other)
+        backend._on_release(key)
+        backend._on_press(key)  # the next press starts clean
+        self.assertFalse(backend.chorded)
+        _settle()
+
+    def test_a_key_without_the_modifier_held_is_not_a_chord(self):
+        backend, key = _hybrid_backend()
+        backend._matches_configured_modifier = lambda k: k is key
+        backend._normalize_modifier_key = lambda k: k
+
+        backend._on_press(MagicMock(name="b"))
+        self.assertFalse(backend.chorded)
+
     def test_release_is_delivered_in_hybrid_mode(self):
         backend, key = _hybrid_backend()
         events = _record(backend)
@@ -153,17 +179,30 @@ class TestHybridLatch(unittest.TestCase):
 
         self.RecognitionState = RecognitionState
 
+        # The focused window, as the one-thought watcher sees it.
+        self.focused = {"id": 0x100}
+        test = self
+
+        class FakeActiveWindow:
+            def get(self):
+                return test.focused["id"]
+
+            def close(self):
+                pass
+
         self.patchers = [
             patch("os.makedirs"),
             patch("vocalinux.ui.tray_indicator.ConfigManager"),
             patch("vocalinux.ui.tray_indicator.KeyboardShortcutManager"),
             patch("vocalinux.ui.tray_indicator.SuspendHandler"),
+            patch("vocalinux.ui.active_window.ActiveWindow", FakeActiveWindow),
         ]
         (
             self.mock_makedirs,
             self.mock_config_class,
             self.mock_ksm_class,
             self.mock_suspend,
+            _,
         ) = [p.start() for p in self.patchers]
 
         self.mock_config = MagicMock()
@@ -186,15 +225,21 @@ class TestHybridLatch(unittest.TestCase):
 
         self.engine.start_recognition.side_effect = start
         self.engine.stop_recognition.side_effect = stop
+        self.engine.seconds_since_speech.return_value = 0.0
 
         from vocalinux.ui.tray_indicator import TrayIndicator
 
-        self.tray = TrayIndicator(speech_engine=self.engine, text_injector=MagicMock())
+        self.injector = MagicMock()
+        self.tray = TrayIndicator(speech_engine=self.engine, text_injector=self.injector)
         # A short window keeps the deferred-stop tests quick.
-        self.tray.shortcut_manager.backend_instance.double_tap_threshold = 0.05
+        self.backend = self.tray.shortcut_manager.backend_instance
+        self.backend.double_tap_threshold = 0.05
+        self.backend.chorded = False
+        self.tray.ONE_THOUGHT_POLL_S = 0.02
 
     def tearDown(self):
         self.tray._cancel_hybrid_stop()
+        self.tray._end_one_thought()
         for p in self.patchers:
             p.stop()
 
@@ -233,15 +278,118 @@ class TestHybridLatch(unittest.TestCase):
         self.tray._hybrid_release()
         self.assertEqual(self.engine.state, self.RecognitionState.IDLE)
 
-    def test_short_tap_defers_the_stop_but_still_stops(self):
+    def _tap(self):
         self.tray._hybrid_press()
-        self.tray._hybrid_release()  # released immediately
+        self.tray._hybrid_release()
 
-        # Still recording: the stop is waiting to see if a second tap arrives.
+    def _one_thought(self):
+        """A bare tap, left long enough that no second tap is coming."""
+        self._tap()
+        time.sleep(0.15)
+        self.assertTrue(self.tray._one_thought)
+
+    def test_short_tap_keeps_recording_as_one_thought(self):
+        self._tap()
+        time.sleep(0.3)
+
+        self.assertEqual(self.engine.state, self.RecognitionState.LISTENING)
+        self.assertTrue(self.tray._one_thought)
+        # Pauses flush segments as they go rather than waiting for a release.
+        self.engine.set_recognition_mode.assert_called_once_with("toggle")
+        self.engine.start_recognition.assert_called_once_with(mode="push_to_talk")
+
+    def test_a_chorded_short_press_is_not_a_tap(self):
+        """Alt+Tab or Alt+b must not start a ten-second dictation."""
+        self.tray._hybrid_press()
+        self.backend.chorded = True
+        self.tray._hybrid_release()
+
+        self.assertEqual(self.engine.state, self.RecognitionState.IDLE)
+        time.sleep(0.15)
+        self.assertFalse(self.tray._one_thought)
+
+    def test_a_tap_ends_the_thought(self):
+        self._one_thought()
+        self._tap()
+        self.assertEqual(self.engine.state, self.RecognitionState.LISTENING)  # window first
+
+        time.sleep(0.15)
+        self.assertEqual(self.engine.state, self.RecognitionState.IDLE)
+        self.assertFalse(self.tray._one_thought)
+        self.engine.start_recognition.assert_called_once()
+
+    def test_a_chord_during_the_thought_does_not_end_it(self):
+        self._one_thought()
+        self.tray._hybrid_press()
+        self.backend.chorded = True
+        self.tray._hybrid_release()
+        time.sleep(0.15)
+
+        self.assertEqual(self.engine.state, self.RecognitionState.LISTENING)
+        self.assertTrue(self.tray._one_thought)
+
+    def test_a_long_quiet_ends_the_thought(self):
+        self._one_thought()
+        self.engine.seconds_since_speech.return_value = self.tray.ONE_THOUGHT_QUIET_S
+        time.sleep(0.1)
+
+        self.assertEqual(self.engine.state, self.RecognitionState.IDLE)
+        self.assertFalse(self.tray._one_thought)
+        self.injector.divert_to_clipboard.assert_not_called()
+
+    def test_a_short_quiet_does_not(self):
+        self._one_thought()
+        self.engine.seconds_since_speech.return_value = self.tray.ONE_THOUGHT_QUIET_S - 1
+        time.sleep(0.1)
+
         self.assertEqual(self.engine.state, self.RecognitionState.LISTENING)
 
-        time.sleep(0.3)
+    def test_leaving_the_window_ends_the_thought_and_parks_the_rest(self):
+        self._one_thought()
+        self.focused["id"] = 0x200
+        time.sleep(0.1)
+
         self.assertEqual(self.engine.state, self.RecognitionState.IDLE)
+        # Diverted BEFORE the stop, which is what transcribes the last words.
+        calls = [c[0] for c in self.injector.method_calls]
+        self.assertIn("divert_to_clipboard", calls)
+        self.engine.stop_recognition.assert_called_once()
+
+    def test_the_next_dictation_pastes_again(self):
+        self._one_thought()
+        self.focused["id"] = 0x200
+        time.sleep(0.1)
+        self.injector.end_divert.reset_mock()
+
+        self.tray._hybrid_press()
+        self.injector.end_divert.assert_called_once()
+
+    def test_an_unreadable_focus_never_ends_the_thought(self):
+        self.focused["id"] = None
+        self._one_thought()
+        time.sleep(0.1)
+
+        self.assertEqual(self.engine.state, self.RecognitionState.LISTENING)
+
+    def test_double_tap_during_the_thought_latches_it(self):
+        self._one_thought()
+        self._tap()
+        self.tray._toggle_hands_free()
+        time.sleep(0.15)
+
+        self.assertTrue(self.tray._hybrid_latched)
+        self.assertFalse(self.tray._one_thought)
+        self.assertEqual(self.engine.state, self.RecognitionState.LISTENING)
+        self.engine.start_recognition.assert_called_once()
+
+    def test_recognition_ending_elsewhere_ends_the_thought(self):
+        self._one_thought()
+        self.engine.state = self.RecognitionState.IDLE
+        self.tray._on_recognition_state_changed(self.RecognitionState.IDLE)
+
+        self.assertFalse(self.tray._one_thought)
+        self.tray._hybrid_press()  # a fresh tap starts, it does not "end"
+        self.assertEqual(self.engine.state, self.RecognitionState.LISTENING)
 
     def test_double_tap_latches_hands_free_and_keeps_the_audio(self):
         self.tray._hybrid_press()

@@ -90,6 +90,13 @@ class TrayIndicator:
         self._hybrid_latched = False
         self._hybrid_press_time = 0.0
         self._hybrid_stop_timer: Optional[threading.Timer] = None
+        # A one-thought dictation: started by a single bare tap, it runs until
+        # the speaker has been quiet for ONE_THOUGHT_QUIET_S, focus leaves the
+        # window it began in, or another tap ends it. _one_thought_end stops
+        # its watcher; _tap_ends_thought marks a press made while one runs.
+        self._one_thought = False
+        self._one_thought_end: Optional[threading.Event] = None
+        self._tap_ends_thought = False
 
         # Get configured shortcut and mode from config
         shortcut = self.config_manager.get_str("shortcuts", "toggle_recognition", "ctrl+ctrl")
@@ -155,8 +162,9 @@ class TrayIndicator:
             self.shortcut_manager.register_press_callback(self._start_recognition)
             self.shortcut_manager.register_release_callback(self._stop_recognition)
         elif mode == "hybrid":
-            # Hold to talk, double-tap to latch hands-free: all three events.
+            # Hold to talk, tap for one thought, double-tap to latch hands-free.
             self._cancel_hybrid_stop()
+            self._end_one_thought()
             self._hybrid_latched = False
             self.shortcut_manager.register_toggle_callback(self._toggle_hands_free)
             self.shortcut_manager.register_press_callback(self._hybrid_press)
@@ -342,6 +350,7 @@ class TrayIndicator:
     def _toggle_recognition(self):
         """Toggle the recognition state between IDLE and LISTENING."""
         if self.speech_engine.state == RecognitionState.IDLE:
+            self.text_injector.end_divert()
             self.speech_engine.start_recognition()
         else:
             self.speech_engine.stop_recognition()
@@ -349,6 +358,7 @@ class TrayIndicator:
     def _start_recognition(self):
         """Start voice recognition (for push-to-talk mode)."""
         if self.speech_engine.state == RecognitionState.IDLE:
+            self.text_injector.end_divert()
             self.speech_engine.start_recognition(mode="push_to_talk")
 
     def _stop_recognition(self):
@@ -358,18 +368,39 @@ class TrayIndicator:
 
     # --- Hybrid mode -------------------------------------------------------
     #
-    # A press starts recording straight away, so no first word is ever lost.
-    # A release ends it -- unless the key was held for less than the
-    # double-tap window, in which case the stop waits that long to see whether
-    # a second tap arrives. If one does, the recording that already started
-    # simply carries on as a hands-free session; if it does not, the deferred
-    # stop fires and the tap behaves like an ordinary short push-to-talk.
+    # One key, three gestures:
+    #
+    #   hold        record while the key is down (push-to-talk)
+    #   tap         record one thought: until ONE_THOUGHT_QUIET_S of quiet,
+    #               until focus leaves the window, or until the next tap
+    #   double-tap  hands-free, latched until the next double-tap
+    #
+    # A press starts recording straight away, so no first word is ever lost,
+    # and it is the release that decides which gesture this was. A release
+    # after the double-tap window is a hold, and stops. A release inside it
+    # waits out the window: a second tap converts the running session to
+    # hands-free, and no second tap converts it to one thought. Either way the
+    # audio recorded so far is kept.
+    #
+    # Only a BARE tap counts. Alt is also a modifier, and Alt+Tab or Alt+b
+    # starting a dictation that then runs for ten seconds would make the key
+    # unusable for anything else, so a release with another key pressed during
+    # the hold (the backend's ``chorded``) behaves like the end of a hold.
+
+    ONE_THOUGHT_QUIET_S = 10.0
+    ONE_THOUGHT_POLL_S = 0.2
 
     @property
     def _hybrid_tap_window(self) -> float:
         """The double-tap window the keyboard backend is actually using."""
         backend = self.shortcut_manager.backend_instance
         return getattr(backend, "double_tap_threshold", 0.3)
+
+    @property
+    def _hybrid_chorded(self) -> bool:
+        """Whether another key went down during this hold of the modifier."""
+        backend = self.shortcut_manager.backend_instance
+        return getattr(backend, "chorded", False) is True
 
     def _cancel_hybrid_stop(self):
         """Cancel a deferred push-to-talk stop, if one is pending."""
@@ -378,12 +409,26 @@ class TrayIndicator:
         if timer is not None:
             timer.cancel()
 
+    def _defer(self, delay: float, action: Callable[[], None]):
+        """Run ``action`` after ``delay`` unless a press cancels it first."""
+        timer = threading.Timer(delay, action)
+        timer.daemon = True
+        with self._hybrid_lock:
+            self._hybrid_stop_timer = timer
+        timer.start()
+
     def _hybrid_press(self):
-        """Handle a key press in hybrid mode: begin holding to talk."""
+        """Handle a key press in hybrid mode."""
         self._cancel_hybrid_stop()
 
         if self._hybrid_latched:
             # Hands-free is on; the key is free for its normal duties.
+            return
+
+        if self._one_thought:
+            # Possibly the tap that ends it; the release decides, so that
+            # Alt+Tab mid-thought does not.
+            self._tap_ends_thought = True
             return
 
         if self.speech_engine.state != RecognitionState.IDLE:
@@ -391,44 +436,102 @@ class TrayIndicator:
             # time alone so the hold is measured from when it really began.
             return
 
+        self._tap_ends_thought = False
         self._hybrid_press_time = time.time()
         self._start_recognition()
 
     def _hybrid_release(self):
-        """Handle a key release in hybrid mode: end the hold, or defer."""
+        """Handle a key release in hybrid mode: decide what the press was."""
         if self._hybrid_latched:
             return
 
         if self.speech_engine.state == RecognitionState.IDLE:
             return
 
+        if self._one_thought:
+            if not self._tap_ends_thought or self._hybrid_chorded:
+                return
+            self._tap_ends_thought = False
+            # Still waits out the window: this tap may be the first of a
+            # double-tap, which latches the running session instead.
+            self._defer(self._hybrid_tap_window + 0.05, self._hybrid_deferred_stop)
+            return
+
         held = time.time() - self._hybrid_press_time
-        if held >= self._hybrid_tap_window:
+        if held >= self._hybrid_tap_window or self._hybrid_chorded:
             self._stop_recognition()
             return
 
-        # Too short to be a hold. It may be the first half of a double-tap, so
-        # keep recording until the window has passed rather than stopping now
-        # and having to start again a moment later.
         delay = self._hybrid_tap_window - held + 0.05
-        logger.debug(f"Hybrid: short tap ({held:.2f}s), deferring stop by {delay:.2f}s")
-        timer = threading.Timer(delay, self._hybrid_deferred_stop)
-        timer.daemon = True
-        with self._hybrid_lock:
-            self._hybrid_stop_timer = timer
-        timer.start()
+        logger.debug(f"Hybrid: short tap ({held:.2f}s), waiting {delay:.2f}s for a second")
+        self._defer(delay, self._begin_one_thought)
 
     def _hybrid_deferred_stop(self):
-        """Fire the stop a short tap deferred, if nothing has superseded it."""
+        """Fire a stop a tap deferred, if nothing has superseded it."""
         with self._hybrid_lock:
             self._hybrid_stop_timer = None
         if self._hybrid_latched:
             return
+        self._end_one_thought()
+        self._stop_recognition()
+
+    def _begin_one_thought(self):
+        """A bare tap with no second one: keep recording, as one thought."""
+        with self._hybrid_lock:
+            self._hybrid_stop_timer = None
+        if self._hybrid_latched or self.speech_engine.state == RecognitionState.IDLE:
+            return
+
+        logger.info("One-thought dictation on")
+        # Pauses inside a thought flush their segment as they would hands-free;
+        # push-to-talk would hold everything until a release that never comes.
+        self.speech_engine.set_recognition_mode("toggle")
+        end = threading.Event()
+        self._one_thought_end = end
+        self._one_thought = True
+        threading.Thread(target=self._watch_one_thought, args=(end,), daemon=True).start()
+
+    def _end_one_thought(self):
+        """Stop the one-thought watcher, if one is running."""
+        self._one_thought = False
+        self._tap_ends_thought = False
+        end, self._one_thought_end = self._one_thought_end, None
+        if end is not None:
+            end.set()
+
+    def _watch_one_thought(self, end: threading.Event):
+        """End the thought on a long enough quiet, or when focus moves."""
+        from .active_window import ActiveWindow
+
+        focus = ActiveWindow()
+        try:
+            origin = focus.get()
+            while not end.wait(self.ONE_THOUGHT_POLL_S):
+                quiet = self.speech_engine.seconds_since_speech()
+                if quiet >= self.ONE_THOUGHT_QUIET_S:
+                    logger.info(f"One-thought dictation: {quiet:.0f}s of quiet, stopping")
+                    break
+                now = focus.get()
+                if origin is not None and now is not None and now != origin:
+                    # Whatever is still being transcribed belongs to the window
+                    # just left; it must not be pasted into this one.
+                    logger.info("One-thought dictation: focus moved, stopping")
+                    self.text_injector.divert_to_clipboard()
+                    break
+            else:
+                return  # ended by a tap, a latch or a stop from elsewhere
+        finally:
+            focus.close()
+
+        if self._one_thought_end is not end:
+            return
+        self._end_one_thought()
         self._stop_recognition()
 
     def _toggle_hands_free(self):
         """Latch hands-free recognition on or off (double-tap in hybrid mode)."""
         self._cancel_hybrid_stop()
+        self._end_one_thought()
 
         if self._hybrid_latched:
             self._hybrid_latched = False
@@ -439,6 +542,7 @@ class TrayIndicator:
         self._hybrid_latched = True
         logger.info("Hands-free dictation on")
         if self.speech_engine.state == RecognitionState.IDLE:
+            self.text_injector.end_divert()
             self.speech_engine.start_recognition(mode="toggle")
         else:
             # The first tap already started recording. Convert that session
@@ -526,6 +630,10 @@ class TrayIndicator:
         if state in (RecognitionState.IDLE, RecognitionState.ERROR) and self._hybrid_latched:
             logger.info("Recognition ended elsewhere — clearing the hands-free latch")
             self._hybrid_latched = False
+        # Same for a one-thought dictation, or its next tap would be read as
+        # the tap that ends it and the key would do nothing.
+        if state in (RecognitionState.IDLE, RecognitionState.ERROR) and self._one_thought:
+            self._end_one_thought()
 
         # Update the UI in the GTK main thread
         GLib.idle_add(self._update_ui, state)

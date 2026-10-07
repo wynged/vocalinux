@@ -53,47 +53,47 @@ SHORTCUT_MODE_DISPLAY_NAMES = {
     "ctrl+ctrl": {
         "toggle": "Double-tap Ctrl",
         "push_to_talk": "Hold Ctrl",
-        "hybrid": "Hold Ctrl, double-tap for hands-free",
+        "hybrid": "Hold Ctrl, tap for one thought, double-tap for hands-free",
     },
     "alt+alt": {
         "toggle": "Double-tap Alt",
         "push_to_talk": "Hold Alt",
-        "hybrid": "Hold Alt, double-tap for hands-free",
+        "hybrid": "Hold Alt, tap for one thought, double-tap for hands-free",
     },
     "shift+shift": {
         "toggle": "Double-tap Shift",
         "push_to_talk": "Hold Shift",
-        "hybrid": "Hold Shift, double-tap for hands-free",
+        "hybrid": "Hold Shift, tap for one thought, double-tap for hands-free",
     },
     "left_ctrl+left_ctrl": {
         "toggle": "Double-tap Left Ctrl",
         "push_to_talk": "Hold Left Ctrl",
-        "hybrid": "Hold Left Ctrl, double-tap for hands-free",
+        "hybrid": "Hold Left Ctrl, tap for one thought, double-tap for hands-free",
     },
     "left_alt+left_alt": {
         "toggle": "Double-tap Left Alt",
         "push_to_talk": "Hold Left Alt",
-        "hybrid": "Hold Left Alt, double-tap for hands-free",
+        "hybrid": "Hold Left Alt, tap for one thought, double-tap for hands-free",
     },
     "left_shift+left_shift": {
         "toggle": "Double-tap Left Shift",
         "push_to_talk": "Hold Left Shift",
-        "hybrid": "Hold Left Shift, double-tap for hands-free",
+        "hybrid": "Hold Left Shift, tap for one thought, double-tap for hands-free",
     },
     "right_ctrl+right_ctrl": {
         "toggle": "Double-tap Right Ctrl",
         "push_to_talk": "Hold Right Ctrl",
-        "hybrid": "Hold Right Ctrl, double-tap for hands-free",
+        "hybrid": "Hold Right Ctrl, tap for one thought, double-tap for hands-free",
     },
     "right_alt+right_alt": {
         "toggle": "Double-tap Right Alt",
         "push_to_talk": "Hold Right Alt",
-        "hybrid": "Hold Right Alt, double-tap for hands-free",
+        "hybrid": "Hold Right Alt, tap for one thought, double-tap for hands-free",
     },
     "right_shift+right_shift": {
         "toggle": "Double-tap Right Shift",
         "push_to_talk": "Hold Right Shift",
-        "hybrid": "Hold Right Shift, double-tap for hands-free",
+        "hybrid": "Hold Right Shift, tap for one thought, double-tap for hands-free",
     },
 }
 
@@ -103,7 +103,7 @@ DEFAULT_SHORTCUT = "ctrl+ctrl"
 SHORTCUT_MODES = {
     "toggle": "Toggle (double-tap to start/stop)",
     "push_to_talk": "Push-to-Talk (hold to speak)",
-    "hybrid": "Hybrid (hold to speak, double-tap for hands-free)",
+    "hybrid": "Hybrid (hold to speak, tap for one thought, double-tap for hands-free)",
 }
 
 DEFAULT_SHORTCUT_MODE = "toggle"
@@ -169,6 +169,10 @@ class KeyboardBackend(ABC):
         self.double_tap_callback: Optional[Callback] = None
         self.key_press_callback: Optional[Callback] = None
         self.key_release_callback: Optional[Callback] = None
+        # Whether another key went down while the modifier was held, since the
+        # modifier's last press. A release reads it to tell a bare tap of Alt
+        # from Alt+Tab or Alt+b, which must never start or stop dictation.
+        self.chorded = False
         self._shortcut = shortcut
         self._mode = mode
         self._modifier_key = parse_shortcut(shortcut)

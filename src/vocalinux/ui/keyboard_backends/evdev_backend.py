@@ -393,6 +393,7 @@ class EvdevKeyboardBackend(KeyboardBackend):
 
                 if value == 1:  # Key press
                     self.key_pressed_devices.add(device_id)
+                    self.chorded = False
                     current_time = time.time()
 
                     if self._mode == "hybrid":
@@ -429,6 +430,9 @@ class EvdevKeyboardBackend(KeyboardBackend):
                         if self.key_release_callback is not None:
                             logger.debug(f"Key release {self._modifier_key} detected (evdev)")
                             threading.Thread(target=self.key_release_callback, daemon=True).start()
+
+            elif value == 1 and self.key_pressed_devices:
+                self.chorded = True
 
         except Exception as e:
             logger.error(f"Error handling key event: {e}")

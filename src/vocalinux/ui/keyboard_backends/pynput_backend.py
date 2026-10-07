@@ -223,6 +223,8 @@ class PynputKeyboardBackend(KeyboardBackend):
                 # start until the key is pressed again.
                 is_repeat = normalized_key in self.current_keys
                 self.current_keys.add(normalized_key)
+                if not is_repeat:
+                    self.chorded = False
 
                 if self._mode == "hybrid":
                     if self._is_double_tap(current_time) and not is_repeat:
@@ -244,6 +246,8 @@ class PynputKeyboardBackend(KeyboardBackend):
 
                 if not is_repeat:
                     self.last_key_press_time = current_time
+            elif self.current_keys:
+                self.chorded = True
         except Exception as e:
             logger.error(f"Error in pynput key press handling: {e}")
 

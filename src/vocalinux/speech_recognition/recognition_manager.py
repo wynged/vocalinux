@@ -857,6 +857,10 @@ class SpeechRecognitionManager:
         # Recording control flags
         self.should_record = False
         self._recognition_mode = "toggle"  # "toggle" or "push_to_talk"
+        # When speech was last heard, on the monotonic clock. Unlike the
+        # per-segment silence counter it is not reset when a segment is
+        # flushed, so it answers "how long has the speaker been quiet?".
+        self._last_speech_time = time.monotonic()
         self.audio_buffer = []
         self._recording_segment_has_speech = False
         self._buffer_lock = threading.Lock()  # Thread safety for audio_buffer
@@ -2349,6 +2353,7 @@ class SpeechRecognitionManager:
         # Set recording flag
         self.should_record = True
         self._recognition_mode = mode
+        self._last_speech_time = time.monotonic()
         self.audio_buffer = []
         self._segment_queue = queue.Queue(maxsize=32)
 
@@ -2378,6 +2383,10 @@ class SpeechRecognitionManager:
             return
         logger.info(f"Recognition mode changed mid-session: {self._recognition_mode} -> {mode}")
         self._recognition_mode = mode
+
+    def seconds_since_speech(self) -> float:
+        """How long since speech was last heard (or the session began)."""
+        return time.monotonic() - self._last_speech_time
 
     def stop_recognition(self):
         """Stop the speech recognition process."""
@@ -2677,6 +2686,7 @@ class SpeechRecognitionManager:
                             silence_counter = 0
                     else:  # Speech
                         self._recording_segment_has_speech = True
+                        self._last_speech_time = time.monotonic()
                         if not speech_detected_in_session:
                             if self._silero_vad is not None:
                                 logger.debug(

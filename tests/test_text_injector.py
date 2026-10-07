@@ -511,6 +511,37 @@ class TestTextInjector(unittest.TestCase):
                     injector.inject_text("a new sentence")
         self.assertEqual(owner.texts[-1], "a new sentence")
 
+    # --- a dictation whose window lost focus ----------------------------
+
+    def test_diverted_segments_park_on_the_clipboard_and_never_paste(self):
+        """Focus moved mid-thought: the rest must not land in the new window."""
+        injector, calls = self._x11_injector_with_paste()
+        owner = self._fake_owner(landed=True)
+        injector.divert_to_clipboard()
+        with patch.object(TextInjector, "_paste_injection_enabled", return_value=True):
+            with patch.object(TextInjector, "_selection_owner", return_value=owner):
+                with patch("subprocess.Popen") as popen:
+                    self.assertTrue(injector.inject_text("the last words"))
+                    self.assertTrue(injector.inject_text(" and a few more"))
+
+        cmds = [c for c, _ in calls]
+        self.assertFalse(any(c[:1] == ["xdotool"] for c in cmds), cmds)
+        self.assertEqual(owner.texts[-1], "the last words and a few more")
+        notification = popen.call_args[0][0]
+        self.assertIn("switched windows", " ".join(notification))
+
+    def test_end_divert_pastes_again(self):
+        injector, calls = self._x11_injector_with_paste()
+        owner = self._fake_owner(landed=True)
+        injector.divert_to_clipboard()
+        injector.end_divert()
+        with patch.object(TextInjector, "_paste_injection_enabled", return_value=True):
+            with patch.object(TextInjector, "_selection_owner", return_value=owner):
+                with patch("threading.Thread", return_value=MagicMock()):
+                    injector.inject_text("Hello world")
+        cmds = [c for c, _ in calls]
+        self.assertIn(["xdotool", "key", "--clearmodifiers", "ctrl+v"], cmds)
+
     def test_a_paste_that_was_read_restores_the_clipboard_as_before(self):
         injector, calls = self._x11_injector_with_paste()
         owner = self._fake_owner(landed=True)
