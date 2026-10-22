@@ -390,6 +390,28 @@ class TestTextInjector(unittest.TestCase):
         self.assertIn(["xdotool", "key", "--clearmodifiers", "ctrl+shift+v"], cmds)
         self.assertNotIn(["xdotool", "key", "--clearmodifiers", "ctrl+v"], cmds)
 
+    def test_x11_paste_uses_ctrl_shift_v_in_a_terminal_with_its_own_class(self):
+        """WezTerm started with --class (the city hall) names no terminal in WM_CLASS.
+
+        A plain Ctrl+V there reaches the program in the pane as ^V; Claude
+        Code then reads the clipboard through xclip, and the paste check calls
+        it a miss while the text lands.
+        """
+        injector, calls = self._x11_injector_with_paste(wm_class='"wynged-hall", "wynged-hall"')
+        owner = self._fake_owner(landed=True)
+        owner.process_of = lambda window_id: 4242
+        with patch.object(TextInjector, "_paste_injection_enabled", return_value=True):
+            with patch.object(TextInjector, "_selection_owner", return_value=owner):
+                with patch(
+                    "vocalinux.text_injection.text_injector._process_name",
+                    side_effect=lambda pid: "wezterm-gui" if pid == 4242 else "",
+                ):
+                    with patch("threading.Thread", return_value=MagicMock()):
+                        injector.inject_text("ls -la")
+        cmds = [c for c, _ in calls]
+        self.assertIn(["xdotool", "key", "--clearmodifiers", "ctrl+shift+v"], cmds)
+        self.assertNotIn(["xdotool", "key", "--clearmodifiers", "ctrl+v"], cmds)
+
     def test_x11_paste_falls_back_to_typing_when_clipboard_fails(self):
         injector, calls = self._x11_injector_with_paste()
         inner = self.mock_subprocess.side_effect
@@ -429,7 +451,7 @@ class TestTextInjector(unittest.TestCase):
         """A stand-in for the clipboard owner, answering "was it read?"."""
 
         class FakeWatch:
-            def landed(self_inner, client_id, timeout):
+            def landed(self_inner, client_id, timeout, pid=None):
                 return landed
 
         class FakeOwner:
@@ -447,6 +469,9 @@ class TestTextInjector(unittest.TestCase):
 
             def owns(self_inner):
                 return self_inner.held
+
+            def process_of(self_inner, window_id):
+                return None
 
         return FakeOwner()
 

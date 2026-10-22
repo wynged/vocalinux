@@ -12,11 +12,14 @@ from vocalinux.text_injection.clipboard_owner import (
     CLIENT_ID_MASK,
     ClipboardOwner,
     client_of,
+    lineage_of,
 )
 
 FOCUSED_WINDOW = 0x28000EE  # a Chrome window
 FOCUSED_HELPER = 0x2800000  # its hidden "Chromium clipboard" window
 CLIPBOARD_MANAGER = 0x1200001  # greenclip, polling once a second
+HELPER_XCLIP = 0x9A00001  # an `xclip -o` the focused app ran to fetch the text
+FOCUSED_PID = 5000
 
 
 class TestClientOf(unittest.TestCase):
@@ -75,10 +78,48 @@ class TestReadClassification(unittest.TestCase):
             self.owner._record_read(0x9900002)
             self.assertFalse(watch.landed(None, 0.0))
 
+    def test_a_read_by_a_process_the_focused_app_started_is_a_paste(self):
+        """desk-capture's chip, and Claude Code in a pane, read through xclip.
+
+        The xclip is an X client of its own, so the client test alone called
+        every one of those pastes a miss while the text landed.
+        """
+        with self.owner.watch() as watch:
+            self.owner._record_read(HELPER_XCLIP, (5123, FOCUSED_PID, 3707))
+            self.assertTrue(watch.landed(client_of(FOCUSED_WINDOW), 0.0, FOCUSED_PID))
+
+    def test_the_focused_process_reading_itself_is_a_paste(self):
+        with self.owner.watch() as watch:
+            self.owner._record_read(HELPER_XCLIP, (FOCUSED_PID, 3707))
+            self.assertTrue(watch.landed(None, 0.0, FOCUSED_PID))
+
+    def test_a_clipboard_manager_is_no_descendant_of_the_focused_app(self):
+        with self.owner.watch() as watch:
+            self.owner._record_read(CLIPBOARD_MANAGER, (11278, 3707))
+            self.assertFalse(watch.landed(client_of(FOCUSED_WINDOW), 0.0, FOCUSED_PID))
+
+    def test_an_unknown_reader_process_is_not_an_answer(self):
+        with self.owner.watch() as watch:
+            self.owner._record_read(HELPER_XCLIP)
+            self.assertFalse(watch.landed(client_of(FOCUSED_WINDOW), 0.0, FOCUSED_PID))
+
     def test_reads_before_the_watch_opened_do_not_count(self):
         self.owner._record_read(0x9900002)
         with self.owner.watch() as watch:
             self.assertFalse(watch.landed(client_of(FOCUSED_WINDOW), 0.0))
+
+
+class TestLineage(unittest.TestCase):
+    def test_a_live_process_leads_its_own_ancestry(self):
+        import os
+
+        chain = lineage_of(os.getpid())
+        self.assertEqual(chain[0], os.getpid())
+        self.assertIn(os.getppid(), chain)
+
+    def test_an_unreadable_process_is_only_itself(self):
+        self.assertEqual(lineage_of(None), ())
+        self.assertEqual(lineage_of(2**22 + 12345), (2**22 + 12345,))
 
 
 class TestAvailability(unittest.TestCase):

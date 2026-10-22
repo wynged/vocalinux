@@ -27,6 +27,16 @@ counts, deliberately: trusting an unrecognised requestor let the very first
 dictation of a session pass because the clipboard manager's poll happened to
 fall inside the window.
 
+Not every app reads the clipboard through its own connection, though. A
+Gio app (desk-capture's chip) answers Ctrl+V by running ``xclip -o``, and
+Claude Code in a tmux pane reads it the same way, so the request comes from
+a short-lived client of its own and the client test above calls a paste that
+landed a miss. X answers this one too: the X-Resource extension maps a
+client to its process, so each read records the reader's process and its
+ancestors while the reader is still connected, and a read counts if the
+focused window's process is among them. The clipboard manager still does
+not count -- nothing focused is its ancestor.
+
 Known limitation: Chromium reads the clipboard on Ctrl+V whether or not
 anything editable is focused, because it has to build the DOM paste event
 either way. So a paste into a browser page always reads as landing, and the
@@ -58,6 +68,25 @@ def client_of(window_id: Optional[int]) -> Optional[int]:
     return window_id & CLIENT_ID_MASK
 
 
+def lineage_of(pid: Optional[int]) -> tuple:
+    """``pid`` and every ancestor of it, nearest first; empty if unknown.
+
+    Read while the process still exists: an ``xclip -o`` that has finished
+    reading is gone a few milliseconds later, and its parent with it.
+    """
+    chain = []
+    while pid and pid > 1 and pid not in chain and len(chain) < 64:
+        chain.append(pid)
+        try:
+            with open(f"/proc/{pid}/stat") as f:
+                # comm is parenthesised and may itself contain ") ", so split
+                # on the last one; ppid is the second field after it.
+                pid = int(f.read().rsplit(")", 1)[1].split()[1])
+        except (OSError, ValueError, IndexError):
+            break
+    return tuple(chain)
+
+
 class _Watch:
     """A detection window opened around a paste keystroke."""
 
@@ -65,7 +94,7 @@ class _Watch:
         self._owner = owner
         self.mark = mark
 
-    def landed(self, client_id: Optional[int], timeout: float) -> bool:
+    def landed(self, client_id: Optional[int], timeout: float, pid: Optional[int] = None) -> bool:
         """True once the focused app read the clipboard; False if it never did.
 
         Returns as soon as that read arrives, so a successful paste costs the
@@ -74,8 +103,12 @@ class _Watch:
         the selection about once a second whatever the user is doing, and with
         no focused client to match against (``client_id`` None) there is
         nothing that could have taken the text.
+
+        ``pid`` is the focused window's process: a read by it, or by any
+        process it started (an ``xclip -o`` it ran to fetch the text), counts
+        as the focused app's read too.
         """
-        return self._owner._wait_for_read(self.mark, client_id, timeout)
+        return self._owner._wait_for_read(self.mark, client_id, timeout, pid)
 
 
 class ClipboardOwner:
@@ -95,7 +128,7 @@ class ClipboardOwner:
     def __init__(self):
         self._cond = threading.Condition()
         self._text: Optional[str] = None
-        self._reads: list = []  # (seq, requestor_id) per content conversion
+        self._reads: list = []  # (seq, requestor_id, lineage) per content conversion
         self._read_seq = 0  # marks index this, not the list, so trimming is safe
         self._owns = False
         self._max_bytes = 0
@@ -108,6 +141,7 @@ class ClipboardOwner:
         self._wake_w = -1
         self._started = False
         self._unavailable = False
+        self._has_res = False
 
     # --- lifecycle ------------------------------------------------------
 
@@ -170,6 +204,10 @@ class ClipboardOwner:
             65536, d.display.info.max_request_length * 4 - self._SIZE_MARGIN
         )
 
+        # Client -> process lookups; without the extension only the client
+        # test is left, which is what there was before it.
+        self._has_res = d.has_extension("X-Resource")
+
         # An async BadWindow is routine here: a requestor can go away between
         # asking and being answered. Swallow it rather than let python-xlib
         # raise it out of the event loop.
@@ -220,6 +258,17 @@ class ClipboardOwner:
             return False
         return bool(result and result[0])
 
+    def process_of(self, window_id: Optional[int], timeout: float = 0.5) -> Optional[int]:
+        """The pid of the process that owns ``window_id``, or None if unknown."""
+        if not window_id or not self.start():
+            return None
+        done = threading.Event()
+        result = []
+        self._post(("pid", window_id, done, result))
+        if not done.wait(timeout):
+            return None
+        return result[0] if result else None
+
     @contextmanager
     def watch(self):
         """Open a detection window around a paste, ignoring every earlier read."""
@@ -227,14 +276,18 @@ class ClipboardOwner:
             mark = self._read_seq
         yield _Watch(self, mark)
 
-    def _wait_for_read(self, mark: int, client_id: Optional[int], timeout: float) -> bool:
+    def _wait_for_read(
+        self, mark: int, client_id: Optional[int], timeout: float, pid: Optional[int] = None
+    ) -> bool:
         deadline = time.monotonic() + timeout
         with self._cond:
             while True:
-                for seq, rid in self._reads:
+                for seq, rid, lineage in self._reads:
                     if seq < mark:
                         continue
                     if client_id is not None and (rid & CLIENT_ID_MASK) == client_id:
+                        return True
+                    if pid and pid in lineage:
                         return True
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
@@ -291,6 +344,28 @@ class ClipboardOwner:
                     result.append(False)
                 finally:
                     done.set()
+            elif command[0] == "pid":
+                _, window_id, done, result = command
+                try:
+                    result.append(self._pid_of_client(window_id))
+                except Exception as e:  # noqa: BLE001 - report, do not kill the thread
+                    logger.debug(f"Could not look up the process of 0x{window_id:x}: {e}")
+                finally:
+                    done.set()
+
+    def _pid_of_client(self, resource_id: int) -> Optional[int]:
+        """The local pid of the X client owning ``resource_id``, via X-Resource."""
+        if not self._has_res:
+            return None
+        from Xlib.ext import res
+
+        reply = self._display.res_query_client_ids(
+            [{"client": resource_id, "mask": res.LocalClientPIDMask}]
+        )
+        for client in reply.ids:
+            if client.spec.mask & res.LocalClientPIDMask and client.value:
+                return int(client.value[0])
+        return None
 
     def _take_ownership(self, text: str) -> bool:
         d = self._display
@@ -316,6 +391,14 @@ class ClipboardOwner:
         with self._cond:
             text = self._text
         target = ev.target
+        lineage = ()
+        if target in self._content_targets and text is not None:
+            # Before answering: once it has the text, an ``xclip -o`` exits
+            # and takes the answer to "whose was it?" with it.
+            try:
+                lineage = lineage_of(self._pid_of_client(ev.requestor.id))
+            except Exception as e:  # noqa: BLE001 - the read still gets served
+                logger.debug(f"Could not look up the requestor's process: {e}")
         # A pre-ICCCM requestor sends property None and means "use the target".
         prop = ev.property if ev.property != X.NONE else target
         served = True
@@ -350,14 +433,15 @@ class ClipboardOwner:
             # paying for when the log will actually show it.
             logger.debug(
                 f"selection request target={self._display.get_atom_name(target)} "
-                f"requestor=0x{ev.requestor.id:x} served={served} content={content}"
+                f"requestor=0x{ev.requestor.id:x} served={served} content={content} "
+                f"lineage={lineage}"
             )
         if content:
-            self._record_read(ev.requestor.id)
+            self._record_read(ev.requestor.id, lineage)
 
-    def _record_read(self, requestor_id: int) -> None:
+    def _record_read(self, requestor_id: int, lineage: tuple = ()) -> None:
         with self._cond:
-            self._reads.append((self._read_seq, requestor_id))
+            self._reads.append((self._read_seq, requestor_id, lineage))
             self._read_seq += 1
             if len(self._reads) > 512:
                 del self._reads[:256]

@@ -27,6 +27,17 @@ from .ibus_engine import (
 logger = logging.getLogger(__name__)
 
 
+def _process_name(pid: Optional[int]) -> str:
+    """The lowercased command name of ``pid``, or "" if it cannot be read."""
+    if not pid:
+        return ""
+    try:
+        with open(f"/proc/{pid}/comm") as f:
+            return f.read().strip().lower()
+    except OSError:
+        return ""
+
+
 def _leave_i3_binding_mode(environment=None) -> None:
     """Drop i3 back to its default binding mode before sending keystrokes.
 
@@ -971,8 +982,17 @@ class TextInjector:
     def _paste_chord_for_focused_window(self) -> str:
         return self._paste_chord_for_window_class(self._get_focused_window_identity()[0])
 
-    def _paste_chord_for_window_class(self, window_class: str) -> str:
-        if any(marker in window_class for marker in self.TERMINAL_WINDOW_CLASSES):
+    def _paste_chord_for_window_class(self, window_class: str, pid: Optional[int] = None) -> str:
+        """Ctrl+Shift+V for a terminal, Ctrl+V for anything else.
+
+        A terminal launched with its own ``--class`` (WezTerm windows that run
+        one program do) has a class that names no terminal, and a plain Ctrl+V
+        there goes to the program inside as ^V -- which Claude Code answers by
+        reading the clipboard through xclip, landing the text by luck. So the
+        process behind the window is asked too.
+        """
+        haystack = f"{window_class} {_process_name(pid)}"
+        if any(marker in haystack for marker in self.TERMINAL_WINDOW_CLASSES):
             return "ctrl+shift+v"
         return "ctrl+v"
 
@@ -1066,8 +1086,9 @@ class TextInjector:
 
         if not owner_holds:
             owner = None
-        chord = self._paste_chord_for_window_class(window_class)
-        landed = self._press_paste(chord, env, owner, window_id)
+        window_pid = owner.process_of(window_id) if owner is not None else None
+        chord = self._paste_chord_for_window_class(window_class, window_pid)
+        landed = self._press_paste(chord, env, owner, window_id, window_pid)
         if landed is None:
             self._schedule_clipboard_restore(generation, env)
             return False
@@ -1085,7 +1106,7 @@ class TextInjector:
         self._schedule_clipboard_restore(generation, env)
         return True
 
-    def _press_paste(self, chord: str, env, owner, window_id):
+    def _press_paste(self, chord: str, env, owner, window_id, window_pid=None):
         """Send the paste chord.
 
         Returns True if the text landed somewhere, False if nothing read the
@@ -1112,7 +1133,7 @@ class TextInjector:
                 return True
             with owner.watch() as watch:
                 press()
-                return watch.landed(client_of(window_id), self.PASTE_READ_TIMEOUT)
+                return watch.landed(client_of(window_id), self.PASTE_READ_TIMEOUT, window_pid)
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
             logger.warning(f"Paste keystroke failed ({e}); falling back to typing")
             return None
