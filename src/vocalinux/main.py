@@ -271,6 +271,7 @@ def main():
     from .speech_recognition import recognition_manager
     from .text_injection import text_injector
     from .text_injection import compose_sink
+    from .text_injection.sound_tags import strip_sound_tags
     from .ui import tray_indicator
     from .ui.action_handler import ActionHandler
     from .ui.config_manager import ConfigManager
@@ -426,9 +427,14 @@ def main():
             Args:
                 text: Raw transcription segment from the speech engine.
             """
-            text_to_inject = text.strip()
+            # Whisper's sound-effect tags, "(keyboard clicking)" or "[Music]",
+            # are never dictated words: drop them here, the one point every
+            # segment passes on its way to the compose window or the focused
+            # app. A segment that was nothing but tags injects nothing.
+            text_to_inject = strip_sound_tags(text.strip())
             if not text_to_inject:
                 return
+            text = text_to_inject
 
             continuing = bool(
                 action_handler.last_injected_text and action_handler.last_injected_text.strip()
